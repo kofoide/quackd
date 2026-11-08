@@ -1,0 +1,36 @@
+name: Release
+
+# Push a tag like v1.0.0 to build the release artifacts and publish a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches QUACKD_VERSION
+        run: |
+          version="$(make -s version)"
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME != QUACKD_VERSION $version"; exit 1; }
+      - name: Install tools
+        run: brew install shellcheck duckdb
+      - name: Lint and test
+        run: make lint test
+      - name: Build artifacts
+        run: make dist
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/dist/quackd
+            build/dist/Quackd-*.zip
+            build/dist/SHA256SUMS
+          body: |
+            See [CHANGELOG.md](https://github.com/kofoide/quackd/blob/main/CHANGELOG.md) for what's new.
+
+            **Quackd.app is not notarized.** After unzipping, move it to Applications and open it. macOS will block it the first time: go to **System Settings → Privacy & Security** and click **Open Anyway**. Alternatively, build it yourself with `make install-app`, which skips this step.

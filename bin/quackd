@@ -1,0 +1,454 @@
+#!/bin/bash
+# quackd — run a DuckDB Quack server as a macOS launchd service.
+#
+# Usage: quackd <command>
+#   init <db>   Create a config file (~/.config/quackd/config) serving <db>
+#   install     Write the launchd agent plist (does not start it; never runs at login)
+#   uninstall   Stop and remove the launchd agent
+#   start|stop|restart  Start (restarts on crash until stopped), stop, or restart the server
+#   status      Show launchd state and whether the port is accepting connections
+#               (--porcelain: stable key=value output for scripts and the menu bar app)
+#   connect     Print a duckdb command that attaches to this server
+#   logs        Tail the server log
+#   run         Run the server in the foreground (what launchd invokes)
+#   version     Print the quackd version
+#
+# https://github.com/kofoide/quackd — MIT License
+set -euo pipefail
+
+QUACKD_VERSION="1.0.0"
+# launchd job label; override with QUACKD_LABEL to run a second, separate service.
+LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
+# Every location can be overridden by environment variable (used by the tests, and
+# passed through the plist so the service sees the same values).
+CONFIG_DIR="${QUACKD_CONFIG_DIR:-$HOME/.config/quackd}"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_DIR="${QUACKD_LOG_DIR:-$HOME/Library/Logs/quackd}"
+LOG_FILE="$LOG_DIR/quackd.log"
+STATE_DIR="${QUACKD_STATE_DIR:-$HOME/Library/Application Support/quackd}"
+# Deliberately NOT in ~/Library/LaunchAgents: launchd auto-loads (and starts) agents
+# there at login. Kept here, the agent only runs after an explicit `quackd start`.
+PLIST="$STATE_DIR/$LABEL.plist"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+FAIL_FILE="$STATE_DIR/$LABEL.failures"
+STABLE_SECONDS=60   # a run that lasted this long resets the consecutive-failure count
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+DOMAIN="gui/$(id -u)"
+
+RUN_MODE=""   # set by `run`, so errors go to the log with a timestamp
+
+ts() { date '+%F %T'; }
+
+die() {
+  if [[ -n "$RUN_MODE" ]]; then echo "$(ts) quackd: $*" >&2; else echo "quackd: $*" >&2; fi
+  exit 1
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "no config at $CONFIG_FILE (run: quackd init <database.duckdb>)"
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+  [[ -n "${QUACK_DB:-}" ]] || die "QUACK_DB not set in $CONFIG_FILE"
+  [[ -n "${QUACK_TOKEN:-}" ]] || die "QUACK_TOKEN not set in $CONFIG_FILE"
+  QUACK_LISTEN="${QUACK_LISTEN:-quack:localhost}"
+  find_duckdb
+  [[ -n "$DUCKDB_BIN" ]] || die "duckdb not found (install it with: brew install duckdb)"
+  [[ -x "$DUCKDB_BIN" ]] || die "duckdb not found at $DUCKDB_BIN"
+  (( ${#QUACK_TOKEN} >= 4 )) || die "QUACK_TOKEN must be at least 4 characters"
+}
+
+# Sets DUCKDB_BIN: the config/env value if set, else duckdb on PATH, else the usual
+# Homebrew locations (launchd and Finder-launched apps have a minimal PATH). Empty if none.
+find_duckdb() {
+  if [[ -z "${DUCKDB_BIN:-}" ]]; then
+    DUCKDB_BIN="$(command -v duckdb || true)"
+    local candidate
+    for candidate in /opt/homebrew/bin/duckdb /usr/local/bin/duckdb; do
+      [[ -z "$DUCKDB_BIN" && -x "$candidate" ]] && DUCKDB_BIN="$candidate"
+    done
+  fi
+  return 0
+}
+
+# SQL string literal; sed rather than ${//} because bash 3.2 (/bin/bash) mangles quotes there.
+sql_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
+
+cmd_init() {
+  if [[ -f "$CONFIG_FILE" ]]; then echo "Config already exists: $CONFIG_FILE"; return; fi
+  local db="${1:-}"
+  [[ -n "$db" ]] || die "usage: quackd init <path/to/database.duckdb>"
+  [[ -f "$db" ]] || die "database not found: $db (create one with: duckdb $(printf '%q' "$db") -c 'select 1')"
+  db="$(cd "$(dirname "$db")" && pwd)/$(basename "$db")"
+  mkdir -p "$CONFIG_DIR"
+  local token; token="$(openssl rand -hex 24)"
+  umask 077
+  cat >"$CONFIG_FILE" <<EOF
+# quackd configuration (sourced by bash)
+QUACK_DB=$(printf '%q' "$db")
+QUACK_LISTEN="quack:localhost"        # default port 9494; e.g. quack:localhost:9500
+QUACK_TOKEN="$token"
+# QUACK_LOG="connections"   # connections (default) | all (raw, incl. queries) | off
+# QUACK_MAX_FAILURES=5      # stop retrying after this many failed starts in a row (0 = never)
+# QUACK_NOTIFY="true"       # macOS notification on first crash and when giving up
+# DUCKDB_BIN="/opt/homebrew/bin/duckdb"
+# QUACK_EXTRA_ARGS="allow_other_hostname=true"   # extra named args for quack_serve()
+EOF
+  chmod 600 "$CONFIG_FILE"
+  echo "Wrote $CONFIG_FILE (mode 600) with a random token."
+  echo "Next: quackd install && quackd start   (quackd connect prints the client command)"
+}
+
+cmd_run() {
+  RUN_MODE=1
+  RUN_STARTED=$(date +%s)
+  # Every exit path (including die and set -e failures) goes through on_run_exit,
+  # which decides whether launchd should retry.
+  trap 'on_run_exit $?' EXIT
+  load_config
+  [[ -f "$QUACK_DB" ]] || die "database not found: $QUACK_DB"
+
+  local serve
+  serve="call quack_serve($(sql_quote "$QUACK_LISTEN"), token=$(sql_quote "$QUACK_TOKEN")"
+  [[ -n "${QUACK_EXTRA_ARGS:-}" ]] && serve+=", $QUACK_EXTRA_ARGS"
+  serve+=");"
+
+  # quack_serve() returns immediately and serves from a background thread, so the
+  # duckdb CLI must never see EOF on stdin. Hold a FIFO open read+write on fd 3 and
+  # feed it to duckdb: no writer ever closes it, so duckdb blocks on read forever.
+  local fifo; fifo="$(mktemp -u "${TMPDIR:-/tmp}/quackd.XXXXXX")"
+  mkfifo -m 600 "$fifo"
+  exec 3<>"$fifo"
+  rm -f "$fifo"
+
+  echo "$(ts) starting quack server: db=$QUACK_DB listen=$QUACK_LISTEN"
+  # The SQL (with the token) is passed via stdin rather than argv so it doesn't show
+  # up in `ps`. .bail on: if quack_serve() fails, exit so launchd retries instead of
+  # idling without serving. quack_serve() echoes the token in its result table, so
+  # discard that output.
+  # Client logging uses DuckDB's logger with only the 'Quack' log type, written to
+  # stdout (-> the log file). It records every connection attempt (accepted or
+  # rejected), every query, and every disconnect; it never includes the token.
+  #   connections: filtered to one readable line per connect/disconnect (default)
+  #   all:         raw DuckDB log rows, including each query's SQL
+  #   off:         no client logging
+  local mode="${QUACK_LOG:-connections}" logging=""
+  case "$mode" in
+    connections|all) logging="CALL enable_logging(['Quack'], level='debug', storage='stdout');" ;;
+    off) ;;
+    *) die "QUACK_LOG must be connections, all, or off (got: $mode)" ;;
+  esac
+  printf '.bail on\n.output /dev/null\n%s\n%s\n.output\n' "$logging" "$serve" >&3
+
+  # duckdb runs as a child (not exec'd) so this script can log when it stops. In
+  # 'connections' mode its stdout goes through the filter via a second FIFO, so we
+  # can wait for the filter to flush before writing the final line.
+  local child filter_pid=""
+  if [[ "$mode" == "connections" ]]; then
+    local logfifo; logfifo="$(mktemp -u "${TMPDIR:-/tmp}/quackd-log.XXXXXX")"
+    mkfifo -m 600 "$logfifo"
+    format_connection_log <"$logfifo" &
+    filter_pid=$!
+    "$DUCKDB_BIN" -no-agent "$QUACK_DB" <&3 >"$logfifo" &
+    child=$!
+    rm -f "$logfifo"
+  else
+    "$DUCKDB_BIN" -no-agent "$QUACK_DB" <&3 &
+    child=$!
+  fi
+  exec 3>&-
+
+  # launchd stops the job with SIGTERM: pass it on to duckdb and remember why.
+  local signal=""
+  trap 'signal=TERM; kill -TERM "$child" 2>/dev/null' TERM
+  trap 'signal=INT;  kill -TERM "$child" 2>/dev/null' INT
+  trap 'signal=HUP;  kill -TERM "$child" 2>/dev/null' HUP
+
+  # `wait` returns early when a trap fires, so keep waiting until duckdb is gone.
+  local rc=0
+  while :; do
+    wait "$child" && rc=0 || rc=$?
+    kill -0 "$child" 2>/dev/null || break
+  done
+  [[ -n "$filter_pid" ]] && wait "$filter_pid" 2>/dev/null
+
+  if [[ -n "$signal" ]]; then
+    echo "$(ts) quack server stopped (received SIG$signal)"
+    exit 0
+  fi
+  echo "$(ts) quack server exited unexpectedly (exit code $rc)"
+  exit $(( rc == 0 ? 1 : rc ))   # never report success for an unexpected exit
+}
+
+# Exit handler for `run`. The plist's KeepAlive is {SuccessfulExit: false}: launchd
+# restarts the job only after a non-zero exit. So: clean stop -> exit 0 (no restart);
+# failure -> exit non-zero (retry in ~10s), until QUACK_MAX_FAILURES consecutive
+# failures, then exit 0 so launchd stops retrying.
+on_run_exit() {
+  local rc=$1
+  trap - EXIT
+  if (( rc == 0 )); then rm -f "$FAIL_FILE"; exit 0; fi
+
+  local max="${QUACK_MAX_FAILURES:-5}" n=0
+  [[ "$max" =~ ^[0-9]+$ ]] || max=5
+  # Count consecutive failures; a run that stayed up a while starts a fresh streak.
+  if (( $(date +%s) - RUN_STARTED < STABLE_SECONDS )) && [[ -f "$FAIL_FILE" ]]; then
+    n="$(cat "$FAIL_FILE" 2>/dev/null || true)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  fi
+  n=$(( n + 1 ))
+  mkdir -p "$STATE_DIR" && echo "$n" >"$FAIL_FILE"
+
+  if (( max > 0 && n >= max )); then
+    echo "$(ts) quackd: giving up after $n consecutive failures. Fix the problem above, then run: quackd start" >&2
+    notify "Quack server gave up" "Failed $n times in a row. Check the log, then run: quackd start"
+    exit 0
+  fi
+  # Notify once per incident (the first failure), not on every retry.
+  if (( n == 1 )); then
+    notify "Quack server stopped unexpectedly" "Exit code $rc. Retrying automatically."
+  fi
+  if (( max > 0 )); then
+    echo "$(ts) quackd: failure $n of $max; launchd will retry in about 10 seconds" >&2
+  else
+    echo "$(ts) quackd: failure $n; launchd will retry in about 10 seconds" >&2
+  fi
+  exit "$rc"
+}
+
+# macOS notification (QUACK_NOTIFY=false disables). Tries, in order: Quackd.app,
+# terminal-notifier (clicking opens the log), then the built-in osascript banner.
+# Never fails the caller: a missing or blocked notification just gets skipped.
+notify() {
+  [[ "${QUACK_NOTIFY:-true}" == "true" ]] || return 0
+  local title="$1" message="$2"
+  # 1. Quackd.app, if installed: it registers the quackd:// URL scheme and posts the
+  #    notification under its own name. `open` fails if no app handles the scheme.
+  if open -g "quackd://notify?title=$(urlencode "$title")&message=$(urlencode "$message")" >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v terminal-notifier >/dev/null 2>&1; then
+    terminal-notifier -title "quackd" -subtitle "$title" -message "$message" \
+      -sound Basso -group "$LABEL" -execute "open -a Console $(printf '%q' "$LOG_FILE")" \
+      >/dev/null 2>&1 || true
+  else
+    # Pass the text as arguments rather than splicing it into the AppleScript source.
+    osascript - "$title" "$message" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+  display notification (item 2 of argv) with title "quackd" subtitle (item 1 of argv) sound name "Basso"
+end run
+APPLESCRIPT
+  fi
+}
+
+# Percent-encode a string for use in a URL query value.
+urlencode() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9._~-])/sprintf("%%%02X", ord($1))/ge'; }
+
+# Turn DuckDB 'Quack' log rows (tab-separated; field 8 = log type, field 10 = message)
+# into one line per connect/disconnect. Everything else (queries, multi-line SQL) is dropped.
+format_connection_log() {
+  perl -ne '
+    BEGIN { $| = 1 }
+    my @f = split /\t/, $_, 10;
+    next unless @f == 10 && $f[7] eq "Quack";
+    my $m = $f[9];
+    my ($type) = $m =~ /\x27message_type\x27: (\w+)/ or next;
+    my @t = localtime;
+    my $ts = sprintf "%04d-%02d-%02d %02d:%02d:%02d", $t[5] + 1900, $t[4] + 1, @t[3, 2, 1, 0];
+    my ($conn)   = $m =~ /\x27quack_connection_id\x27: \x27?([0-9A-F]+)/;
+    my ($client) = $m =~ /\x27client_id_hash\x27: ([0-9A-F]+)/;
+    if ($type eq "CONNECTION_REQUEST") {
+      if ($m =~ /\x27response_type\x27: ERROR_RESPONSE/) {
+        my ($err) = $m =~ /\x27error\x27: \x27(.*?)\x27\}/;
+        print "$ts connection REJECTED: ", ($err // "unknown error"), "\n";
+      } else {
+        print "$ts connection accepted\n";
+      }
+    } elsif ($type eq "DISCONNECT_MESSAGE") {
+      printf "%s disconnected (connection %s, client %s)\n", $ts,
+        substr($conn // "?", 0, 8), substr($client // "?", 0, 8);
+    }
+  '
+}
+
+# Escape text for inclusion in plist XML.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+write_plist() {
+  mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(xml_escape "$LABEL")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml_escape "$SELF")</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>QUACKD_CONFIG_DIR</key><string>$(xml_escape "$CONFIG_DIR")</string>
+    <key>QUACKD_STATE_DIR</key><string>$(xml_escape "$STATE_DIR")</string>
+    <key>QUACKD_LOG_DIR</key><string>$(xml_escape "$LOG_DIR")</string>
+    <key>QUACKD_LABEL</key><string>$(xml_escape "$LABEL")</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$(xml_escape "$LOG_FILE")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$LOG_FILE")</string>
+</dict>
+</plist>
+EOF
+}
+
+is_loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+
+cmd_install() {
+  load_config
+  write_plist
+  rm -f "$LEGACY_PLIST"
+  echo "Installed $PLIST (not started). Run 'quackd start' to start it."
+  if is_loaded; then echo "Note: $LABEL is already running; run 'quackd restart' to apply plist changes."; fi
+}
+
+cmd_uninstall() {
+  is_loaded && launchctl bootout "$DOMAIN/$LABEL" || true
+  rm -f "$PLIST" "$LEGACY_PLIST"
+  echo "Removed $LABEL"
+}
+
+cmd_start() {
+  [[ -f "$PLIST" ]] || die "not installed (run: quackd install)"
+  rm -f "$FAIL_FILE"
+  if is_loaded; then launchctl kickstart "$DOMAIN/$LABEL"; else launchctl bootstrap "$DOMAIN" "$PLIST"; fi
+  echo "Started"
+}
+
+cmd_stop() {
+  is_loaded && launchctl bootout "$DOMAIN/$LABEL" || true
+  echo "Stopped"
+}
+
+cmd_restart() {
+  [[ -f "$PLIST" ]] || die "not installed (run: quackd install)"
+  rm -f "$FAIL_FILE"
+  # Unload and reload (rather than kickstart -k) so plist changes from `install` apply.
+  is_loaded && launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null && { echo "Restarted"; return; }
+    perl -e 'select(undef, undef, undef, 0.5)'
+  done
+  die "could not restart $LABEL (try: quackd stop; quackd start)"
+}
+
+# Machine-readable status: one key=value per line, values never quoted. Keys:
+# version installed loaded state pid runs last_exit failures max_failures listening
+# host port log config configured config_error duckdb service_script
+# The menu bar app depends on these keys: add new ones freely, don't rename or remove.
+status_porcelain() {
+  local info="" state="" pid="" runs="" last_exit="" failures=0 listening=no host="" port=""
+  local installed=no loaded=no max="5" configured=no config_error="" service_script=""
+  if [[ -f "$PLIST" ]]; then
+    installed=yes
+    service_script="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST" 2>/dev/null || true)"
+  fi
+  if is_loaded; then
+    loaded=yes
+    info="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null || true)"
+    field() { printf '%s\n' "$info" | sed -n "s/^$(printf '\t')$1 = //p" | head -1; }
+    state="$(field state)"; pid="$(field pid)"; runs="$(field runs)"; last_exit="$(field 'last exit code')"
+  fi
+  if [[ -f "$FAIL_FILE" ]]; then
+    failures="$(cat "$FAIL_FILE" 2>/dev/null || echo 0)"
+    [[ "$failures" =~ ^[0-9]+$ ]] || failures=0
+  fi
+  config_error="$( (load_config) 2>&1 >/dev/null || true)"
+  config_error="${config_error#quackd: }"
+  if [[ -z "$config_error" ]]; then
+    configured=yes
+    load_config
+    max="${QUACK_MAX_FAILURES:-5}"; [[ "$max" =~ ^[0-9]+$ ]] || max=5
+    listen_host_port
+    host="$LISTEN_HOST"; port="$LISTEN_PORT"
+    nc -z -G 2 "$host" "$port" 2>/dev/null && listening=yes
+  else
+    find_duckdb
+  fi
+  printf '%s\n' "version=$QUACKD_VERSION" "installed=$installed" "loaded=$loaded" "state=$state" \
+    "pid=$pid" "runs=$runs" "last_exit=$last_exit" "failures=$failures" "max_failures=$max" \
+    "listening=$listening" "host=$host" "port=$port" "log=$LOG_FILE" "config=$CONFIG_FILE" \
+    "configured=$configured" "config_error=${config_error//$'\n'/ }" "duckdb=${DUCKDB_BIN:-}" \
+    "service_script=$service_script"
+}
+
+# Split QUACK_LISTEN (quack:host[:port]) into LISTEN_HOST / LISTEN_PORT (default 9494).
+listen_host_port() {
+  local hostport="${QUACK_LISTEN#quack:}"
+  LISTEN_HOST="${hostport%%:*}"; LISTEN_PORT="9494"
+  [[ "$hostport" == *:* ]] && LISTEN_PORT="${hostport##*:}"
+  return 0
+}
+
+# Print a ready-to-paste duckdb command that attaches this server as `remotedb`.
+cmd_connect() {
+  load_config
+  listen_host_port
+  local sql
+  sql="INSTALL quack; LOAD quack; ATTACH $(sql_quote "quack:$LISTEN_HOST:$LISTEN_PORT") AS remotedb (TOKEN $(sql_quote "$QUACK_TOKEN"));"
+  if [[ "$sql" == *[\"\$\`\\!]* ]]; then
+    printf 'duckdb -cmd %q\n' "$sql"   # token has shell-special characters: fully escape
+  else
+    printf 'duckdb -cmd "%s"\n' "$sql"
+  fi
+}
+
+cmd_status() {
+  if [[ "${1:-}" == "--porcelain" ]]; then status_porcelain; return; fi
+  local info="" running=""
+  if is_loaded; then
+    info="$(launchctl print "$DOMAIN/$LABEL" | grep -E "^$(printf "\t")(state|pid|last exit code|runs) =" | sed "s/^$(printf "\t")/  /")"
+    echo "$info"
+    [[ "$info" == *"state = running"* ]] && running=1
+  else
+    echo "  launchd: not loaded"
+  fi
+  # The streak is only cleared by a clean stop or a run lasting STABLE_SECONDS, so
+  # only report it when the server isn't running.
+  if [[ -z "$running" && -f "$FAIL_FILE" ]]; then
+    echo "  consecutive failures: $(cat "$FAIL_FILE") (see: quackd logs)"
+  fi
+  ( load_config ) >/dev/null 2>&1 || return 0
+  load_config
+  listen_host_port
+  local host="$LISTEN_HOST" port="$LISTEN_PORT"
+  if nc -z -G 2 "$host" "$port" 2>/dev/null; then
+    echo "  listening: yes ($host:$port)"
+  else
+    echo "  listening: no ($host:$port)"
+  fi
+}
+
+cmd_logs() { mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; tail -n 50 -f "$LOG_FILE"; }
+
+case "${1:-}" in
+  init) cmd_init "${2:-}" ;;
+  version|--version|-v) echo "quackd $QUACKD_VERSION" ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  status) cmd_status "${2:-}" ;;
+  connect) cmd_connect ;;
+  logs) cmd_logs ;;
+  run) cmd_run ;;
+  *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; exit 1 ;;
+esac

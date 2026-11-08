@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>net.kofoid.quackd.menu</string>
+  <key>CFBundleName</key><string>Quackd</string>
+  <key>CFBundleDisplayName</key><string>Quackd</string>
+  <key>CFBundleExecutable</key><string>@EXE_NAME@</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>LSMinimumSystemVersion</key><string>@MIN_MACOS@</string>
+  <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSHumanReadableCopyright</key><string>MIT License — github.com/kofoide/quackd</string>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>net.kofoid.quackd.menu</string>
+      <key>CFBundleURLSchemes</key>
+      <array><string>quackd</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>

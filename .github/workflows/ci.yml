@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install shellcheck duckdb
+      - name: Lint
+        run: make lint
+      - name: Test
+        run: make test
+      - name: Build app
+        run: make app
