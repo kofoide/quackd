@@ -66,4 +66,4 @@ Release builds are ad-hoc signed, so macOS asks users to click **Open Anyway** t
 3. In the release workflow, sign with `codesign --options runtime --sign "Developer ID Application: …"`.
 4. Notarize the zip with `xcrun notarytool submit --wait`, then staple the result with `xcrun stapler staple`.
 
-The certificate and the App Store Connect API key go in GitHub Actions secrets. With a notarized build, you could also offer a Homebrew **cask** for the app.
+The certificate and the App Store Connect API key go in GitHub Actions secrets. With a notarized build, the `quackd-menu` cask could drop its **Open Anyway** caveat.

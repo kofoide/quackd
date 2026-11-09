@@ -19,7 +19,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.6.0"
+QUACKD_VERSION="1.6.1"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and

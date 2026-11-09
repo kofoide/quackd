@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.6.1] - 2026-11-09
+
+No changes to the CLI or the app.
+
+### Packaging and docs
+- The menu bar app can now be installed with Homebrew: `brew install --cask kofoide/tap/quackd-menu`. The README covers installing, upgrading, and uninstalling both the formula and the cask.
+- Releases update the Homebrew tap automatically. The release workflow runs the new `scripts/update-tap.sh`, which sets the formula's and cask's versions and checksums. The formula template in `packaging/homebrew/` was removed; the tap is now the only copy.
+
 ## [1.6.0] - 2026-11-09
 
 ### quackd (CLI)

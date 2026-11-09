@@ -35,15 +35,20 @@ make install-app    # the menu bar app → ~/Applications/Quackd.app (optional)
 
 To install the CLI somewhere else, use `make install PREFIX=/usr/local`. Apps you build yourself open without any macOS security prompt.
 
-### CLI with Homebrew
+### With Homebrew
 
 ```sh
-brew install kofoide/tap/quackd
+brew install kofoide/tap/quackd               # the quackd CLI
+brew install --cask kofoide/tap/quackd-menu   # the menu bar app → /Applications/Quackd.app (optional)
 ```
+
+Install either one or both. The app bundles its own copy of `quackd`, so it doesn't need the CLI. To upgrade, run `brew upgrade quackd` and `brew upgrade --cask quackd-menu`.
+
+The app isn't notarized by Apple, so macOS blocks it the first time you open it. Go to **System Settings → Privacy & Security** and click **Open Anyway**. You only need to do this once.
 
 ### Prebuilt app from Releases
 
-Download `Quackd-X.Y.Z.zip` from [Releases](https://github.com/kofoide/quackd/releases), unzip it, and move **Quackd.app** to Applications. The app isn't notarized by Apple, so macOS blocks it the first time you open it. Go to **System Settings → Privacy & Security** and click **Open Anyway**. You only need to do this once.
+Download `Quackd-X.Y.Z.zip` from [Releases](https://github.com/kofoide/quackd/releases), unzip it, and move **Quackd.app** to Applications. As with the Homebrew cask, click **Open Anyway** in **System Settings → Privacy & Security** the first time you open it.
 
 ## Quick start
 
@@ -177,6 +182,9 @@ When the log reaches `QUACK_LOG_MAX_MB` (10 MB by default), it's rotated: the ol
 ```sh
 quackd uninstall                  # stop and remove the service
 make uninstall uninstall-app      # remove the CLI and the app (from the clone)
+# or, if you installed with Homebrew:
+brew uninstall quackd
+brew uninstall --cask quackd-menu # add --zap to also remove the config, log, and service files
 rm -rf ~/.config/quackd ~/Library/Logs/quackd "$HOME/Library/Application Support/quackd"
 ```
 
