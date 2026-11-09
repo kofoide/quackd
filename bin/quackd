@@ -3,6 +3,7 @@
 #
 # Usage: quackd <command>
 #   init <db>   Create a config file (~/.config/quackd/config) serving <db>
+#   use [<db>]  Serve a different database (restarts a running server); no <db>: print it
 #   install     Write the launchd agent plist (does not start it; never runs at login)
 #   uninstall   Stop and remove the launchd agent
 #   start|stop|restart  Start (restarts on crash until stopped), stop, or restart the server
@@ -16,7 +17,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.0.0"
+QUACKD_VERSION="1.5.0"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and
@@ -73,12 +74,24 @@ find_duckdb() {
 # SQL string literal; sed rather than ${//} because bash 3.2 (/bin/bash) mangles quotes there.
 sql_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
 
+# Check that $1 is an existing DuckDB database (or an empty file, which DuckDB
+# initializes on open) and print its absolute path. Catching a wrong file here gives a
+# clear error instead of a crash-and-retry loop when the server starts.
+check_db() {
+  local db="$1"
+  [[ -f "$db" ]] || die "database not found: $db (create one with: duckdb $(printf '%q' "$db") -c 'select 1')"
+  # DuckDB files carry the magic bytes "DUCK" at offset 8.
+  if [[ -s "$db" && "$(dd if="$db" bs=1 skip=8 count=4 2>/dev/null)" != "DUCK" ]]; then
+    die "not a DuckDB database: $db"
+  fi
+  printf '%s\n' "$(cd "$(dirname "$db")" && pwd)/$(basename "$db")"
+}
+
 cmd_init() {
   if [[ -f "$CONFIG_FILE" ]]; then echo "Config already exists: $CONFIG_FILE"; return; fi
   local db="${1:-}"
   [[ -n "$db" ]] || die "usage: quackd init <path/to/database.duckdb>"
-  [[ -f "$db" ]] || die "database not found: $db (create one with: duckdb $(printf '%q' "$db") -c 'select 1')"
-  db="$(cd "$(dirname "$db")" && pwd)/$(basename "$db")"
+  db="$(check_db "$db")" || exit 1
   mkdir -p "$CONFIG_DIR"
   local token; token="$(openssl rand -hex 24)"
   umask 077
@@ -96,6 +109,40 @@ EOF
   chmod 600 "$CONFIG_FILE"
   echo "Wrote $CONFIG_FILE (mode 600) with a random token."
   echo "Next: quackd install && quackd start   (quackd connect prints the client command)"
+}
+
+# With no argument, print the database being served. With one, point the config at
+# that database instead (only the QUACK_DB line changes) and, if the server was
+# started and not stopped, restart it so the change takes effect now.
+cmd_use() {
+  local db="${1:-}" current="" line tmp
+  [[ -f "$CONFIG_FILE" ]] || die "no config at $CONFIG_FILE (run: quackd init <database.duckdb>)"
+  # shellcheck source=/dev/null
+  current="$(source "$CONFIG_FILE" >/dev/null 2>&1; printf '%s' "${QUACK_DB:-}")"
+  if [[ -z "$db" ]]; then
+    [[ -n "$current" ]] || die "QUACK_DB not set in $CONFIG_FILE"
+    printf '%s\n' "$current"; return
+  fi
+  db="$(check_db "$db")" || exit 1
+  if [[ "$db" == "$current" ]]; then echo "Already serving $db"; return; fi
+
+  # Rewrite the config through a temp file in the same directory (mktemp makes it
+  # mode 600), then rename it into place, so the config is never half-written.
+  # The new line goes through ENVIRON because awk -v would interpret backslashes.
+  line="QUACK_DB=$(printf '%q' "$db")"
+  tmp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")"
+  if grep -q '^QUACK_DB=' "$CONFIG_FILE"; then
+    QUACKD_DB_LINE="$line" awk '/^QUACK_DB=/ { print ENVIRON["QUACKD_DB_LINE"]; next } { print }' \
+      "$CONFIG_FILE" >"$tmp"
+  else
+    { cat "$CONFIG_FILE"; printf '%s\n' "$line"; } >"$tmp"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  echo "Now serving $db"
+  # Loaded means started and not stopped (stop unloads the job), including retrying
+  # or given up; a restart resets the failure count and tries the new database.
+  if is_loaded; then cmd_restart; fi
 }
 
 cmd_run() {
@@ -351,11 +398,11 @@ cmd_restart() {
 
 # Machine-readable status: one key=value per line, values never quoted. Keys:
 # version installed loaded state pid runs last_exit failures max_failures listening
-# host port log config configured config_error duckdb service_script
+# host port log config configured config_error duckdb service_script db
 # The menu bar app depends on these keys: add new ones freely, don't rename or remove.
 status_porcelain() {
   local info="" state="" pid="" runs="" last_exit="" failures=0 listening=no host="" port=""
-  local installed=no loaded=no max="5" configured=no config_error="" service_script=""
+  local installed=no loaded=no max="5" configured=no config_error="" service_script="" db=""
   if [[ -f "$PLIST" ]]; then
     installed=yes
     service_script="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST" 2>/dev/null || true)"
@@ -375,6 +422,7 @@ status_porcelain() {
   if [[ -z "$config_error" ]]; then
     configured=yes
     load_config
+    db="$QUACK_DB"
     max="${QUACK_MAX_FAILURES:-5}"; [[ "$max" =~ ^[0-9]+$ ]] || max=5
     listen_host_port
     host="$LISTEN_HOST"; port="$LISTEN_PORT"
@@ -386,7 +434,7 @@ status_porcelain() {
     "pid=$pid" "runs=$runs" "last_exit=$last_exit" "failures=$failures" "max_failures=$max" \
     "listening=$listening" "host=$host" "port=$port" "log=$LOG_FILE" "config=$CONFIG_FILE" \
     "configured=$configured" "config_error=${config_error//$'\n'/ }" "duckdb=${DUCKDB_BIN:-}" \
-    "service_script=$service_script"
+    "service_script=$service_script" "db=$db"
 }
 
 # Split QUACK_LISTEN (quack:host[:port]) into LISTEN_HOST / LISTEN_PORT (default 9494).
@@ -429,6 +477,7 @@ cmd_status() {
   load_config
   listen_host_port
   local host="$LISTEN_HOST" port="$LISTEN_PORT"
+  echo "  database: $QUACK_DB"
   if nc -z -G 2 "$host" "$port" 2>/dev/null; then
     echo "  listening: yes ($host:$port)"
   else
@@ -440,6 +489,7 @@ cmd_logs() { mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; tail -n 50 -f "$LOG_FILE"; 
 
 case "${1:-}" in
   init) cmd_init "${2:-}" ;;
+  use) cmd_use "${2:-}" ;;
   version|--version|-v) echo "quackd $QUACKD_VERSION" ;;
   install) cmd_install ;;
   uninstall) cmd_uninstall ;;

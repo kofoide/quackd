@@ -79,6 +79,7 @@ Then query `remotedb` like a local database. To use DuckDB's web UI, add `CALL s
 | Command | What it does |
 |---|---|
 | `quackd init <db>` | Create `~/.config/quackd/config` for `<db>` with a random token. It won't overwrite an existing config. |
+| `quackd use [<db>]` | Serve a different database. If the server is running, it restarts with the new one. With no `<db>`, it prints the current database. |
 | `quackd install` | Register the launchd service. Doesn't start it. Run it again after upgrading. |
 | `quackd start` / `stop` / `restart` | Control the server. `restart` also applies a reinstalled service file. |
 | `quackd status` | launchd state, failure count, and whether the port is accepting connections. `--porcelain` gives stable `key=value` output for scripts. |
@@ -98,6 +99,7 @@ Then query `remotedb` like a local database. To use DuckDB's web UI, add `CALL s
 | warning triangle | Gave up after repeated failures, DuckDB isn't installed, or status is unavailable |
 
 The menu offers Start, Stop, and Restart, plus:
+- **Database**: switch which database is served. It lists the databases you've used recently, with the current one checked, and **Choose Database…** to pick another file. If the server is running, it asks before restarting it, because connected clients get disconnected.
 - **Copy DuckDB Connect Command**
 - **Open Log**, which opens the log in Console
 - **Edit Config**

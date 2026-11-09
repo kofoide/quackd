@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.5.0] - 2026-11-09
+
+### quackd (CLI)
+- New `quackd use <db>` switches the database being served. It changes only the `QUACK_DB` line in the config and restarts the server if it's running. `quackd use` with no argument prints the current database.
+- `init` and `use` reject files that aren't DuckDB databases, instead of failing later as a crash loop.
+- `status` shows the database, and `status --porcelain` has a new `db` key.
+
+### Quackd.app (menu bar)
+- New **Database** submenu: recent databases and **Choose Database…**. It confirms before restarting a running server.
+
 ## [1.0.0] - 2026-11-08
 
 First public release.

@@ -98,6 +98,9 @@ Percent-encodes text for a URL query value. It uses Perl, so non-ASCII character
 ### `xml_escape <text>`
 Escapes `&`, `<`, and `>` so that paths and labels can go safely into the plist's XML.
 
+### `check_db <path>`
+Makes sure a path is usable as the database, then prints its absolute path. The file must exist. If it isn't empty, bytes 8–11 must be `DUCK`, the marker at the start of every DuckDB file. An empty file passes, because DuckDB sets one up when it opens it. Without this check, picking the wrong file would only show up when the server starts, as five crashes in a row. `init` and `use` both call it inside `$(…)`, so its `die` ends only that subshell, and the caller follows with `|| exit 1`.
+
 ### `is_loaded`
 Asks launchd whether the job is currently loaded. It returns success or failure and prints nothing. "Loaded" means launchd knows about the job, whether or not the server is running right now.
 
@@ -137,7 +140,16 @@ DuckDB's log rows are tab-separated. Field 8 is the log type and field 10 is the
 ## Commands
 
 ### `cmd_init` (`quackd init <db>`)
-Creates the config file if it doesn't exist yet. It requires a database path, which must point to an existing file, and stores it as an absolute path. The path is written with `printf %q`, so spaces and quotes survive being `source`d. It generates a random 48-character token with `openssl rand -hex 24`, sets `umask 077` and `chmod 600` so only you can read the file, and includes commented-out lines for the optional settings. If the file already exists, it leaves it alone.
+Creates the config file if it doesn't exist yet. It requires a database path, which `check_db` validates and makes absolute. The path is written with `printf %q`, so spaces and quotes survive being `source`d. It generates a random 48-character token with `openssl rand -hex 24`, sets `umask 077` and `chmod 600` so only you can read the file, and includes commented-out lines for the optional settings. If the file already exists, it leaves it alone.
+
+### `cmd_use` (`quackd use [<db>]`)
+Switches the server to another database. With no argument, it just prints the current `QUACK_DB`.
+
+With a path:
+1. **Validates** it with `check_db`. If it's already the database being served, it says so and stops.
+2. **Rewrites only the `QUACK_DB=` line.** Your token, listen address, and comments stay as they are. The new line is written with `printf %q`, like `init` does. It's handed to `awk` through `ENVIRON` rather than `-v`, because `-v` would treat backslashes in the path as escape codes. If the config has no `QUACK_DB=` line, it's added at the end.
+3. **Writes safely.** The result goes to a temp file in the config folder, which `mktemp` creates readable only by you. That file is then renamed over the config, so the config is never left half-written.
+4. **Restarts if needed.** If the job is loaded, it calls `cmd_restart`. "Loaded" means the server was started and not stopped: running, retrying, or given up. The restart also clears the failure count. A stopped server stays stopped and serves the new database at the next `start`.
 
 ### `cmd_install` (`quackd install`)
 Loads the config to catch mistakes early, writes the plist, and deletes the leftover plist from `LaunchAgents` if there is one. It does **not** start the server. If the job is already loaded, it reminds you to run `restart`, because launchd only reads the plist when the job is loaded.
@@ -176,6 +188,7 @@ The same information in a form that's easy for programs to read: one `key=value`
   - `config_error`: its error message otherwise.
   - `duckdb`: the DuckDB path that was found, empty if none.
   - `service_script`: the script path recorded in the installed plist.
+- **Database:** `db`, the `QUACK_DB` path. It's empty if the config doesn't load.
 
 To get `config_error`, it runs `load_config` in a subshell and captures what `die` prints.
 
@@ -275,6 +288,10 @@ An invalid `QUACK_MAX_FAILURES` falls back to 5, and `0` means retry forever.
   - **Repairing the service:** `repairServiceIfNeeded` runs `quackd install` once if the installed plist points at a script that no longer exists. That happens when the service was installed from a clone that was later moved or deleted. Running `install` repoints the service at the app's copy. If the recorded script still exists, for example a Homebrew or `make install` copy, the app leaves it alone.
   - **`perform(args)`** runs `start`, `stop`, `restart`, or `install`. It shows circular arrows while it runs and an alert if the command fails, then refreshes immediately and again after 1 and 3 seconds.
   - **`setUp()`** handles first-run setup. An open panel picks the database, then the app runs `quackd init <db>` and `quackd install`.
+  - **Switching databases:**
+    - **Picking a file:** `chooseDatabase()` opens the same file picker, starting in the current database's folder.
+    - **Switching:** `switchDatabase(to:)` runs `quackd use <db>`. If the server is loaded, it first asks for confirmation, because the restart disconnects clients.
+    - **Recents:** `recentDatabases` holds up to 8 databases, newest first, in `UserDefaults`. Every database the app sees in `status` is added, including ones switched from the CLI. Files that no longer exist are hidden, and `displayName` adds the folder when two recents share a file name.
   - **Menu actions:** `copyConnectCommand()`, `openLog()`, `openConfig()`, `openDuckDBInstallPage()`, and `openProjectPage()`.
   - **Login item:** `setOpenAtLogin` registers or removes the *app* as a login item with `SMAppService.mainApp`. It never affects the server.
   - **Display:** `iconName`, `statusLine`, and `detailLine` map the phase to an SF Symbol and the text at the top of the menu. `detailLine` explains a missing DuckDB or a broken config.
@@ -283,6 +300,8 @@ An invalid `QUACK_MAX_FAILURES` falls back to 5, and `0` means retry forever.
   - **Not configured:** "Set Up…"
   - **Not installed:** "Install Service"
   - **Otherwise:** Start, Stop, and Restart, each disabled when it doesn't apply.
+
+  Once configured, a **Database: *name*** submenu sits under the status line. It lists the recent databases, with the current one checked, followed by Choose Database… and Clear Recent Databases.
 
   The menu ends with the version, which links to the GitHub page.
 - **`QuackdMenuApp`** is the entry point: a `MenuBarExtra` with `.menu` style, and `AppDelegate` attached through `@NSApplicationDelegateAdaptor`.
@@ -310,6 +329,7 @@ Everything runs against a temporary folder and the label `net.kofoid.quackd-test
   - `sql_quote`, `urlencode`, and `xml_escape`, which are loaded straight from the script with `grep`
   - `init`: errors, a path with spaces and quotes, file mode 600, refusing to overwrite
   - every porcelain key is present
+  - `use`: printing the current database, rejecting missing and non-DuckDB files, a path with `$`, `\`, and `"`, leaving the token and file mode alone, no-op on the same database, no leftover temp files
   - `install` writes a valid plist
   - `connect` output round-trips through the shell
 - **Integration tests** run only if `duckdb` is installed. They start `quackd run` on a random port and check that:

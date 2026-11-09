@@ -35,6 +35,7 @@ struct ServiceStatus: Equatable {
     var configError = ""
     var duckdb = ""
     var serviceScript = ""  // script path recorded in the installed launchd plist
+    var db = ""             // database being served (QUACK_DB); empty if not configured
     var error: String?      // set when the status command itself failed
 
     enum Phase {
@@ -76,6 +77,7 @@ struct ServiceStatus: Equatable {
             case "config_error": s.configError = value
             case "duckdb": s.duckdb = value
             case "service_script": s.serviceScript = value
+            case "db": s.db = value
             default: break
             }
         }
@@ -200,6 +202,10 @@ final class Controller: ObservableObject {
     @Published var busy: String?            // name of the action in progress, if any
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
     @Published var setupError: String?
+    /// Databases served before, most recent first; shown in the Database submenu.
+    @Published private(set) var recentDatabases: [String] =
+        UserDefaults.standard.stringArray(forKey: "recentDatabases") ?? []
+    private let maxRecents = 8
 
     let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
     private var timer: Timer?
@@ -226,6 +232,7 @@ final class Controller: ObservableObject {
             if result.code != 0 { s.error = result.output.trimmingCharacters(in: .whitespacesAndNewlines) }
             status = s
             AppDelegate.logPath = s.log
+            if !s.db.isEmpty { rememberDatabase(s.db) }
             openAtLogin = SMAppService.mainApp.status == .enabled
             await repairServiceIfNeeded(s)
         }
@@ -259,16 +266,7 @@ final class Controller: ObservableObject {
 
     /// First-run setup: pick a database, then `quackd init <db>` and `quackd install`.
     func setUp() {
-        NSApp.activate(ignoringOtherApps: true)
-        let panel = NSOpenPanel()
-        panel.title = "Choose the DuckDB database to serve"
-        panel.prompt = "Serve This Database"
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if let duckdbType = UTType(filenameExtension: "duckdb") {
-            panel.allowedContentTypes = [duckdbType, .data]
-        }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let url = pickDatabase() else { return }
         busy = "setup"
         Task {
             let initResult = await Shell.quackd(["init", url.path])
@@ -284,6 +282,73 @@ final class Controller: ObservableObject {
             }
             refresh()
         }
+    }
+
+    /// Ask for a .duckdb file, starting in the folder of the current database.
+    private func pickDatabase() -> URL? {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSOpenPanel()
+        panel.title = "Choose the DuckDB database to serve"
+        panel.prompt = "Serve This Database"
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if let duckdbType = UTType(filenameExtension: "duckdb") {
+            panel.allowedContentTypes = [duckdbType, .data]
+        }
+        if !status.db.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: status.db).deletingLastPathComponent()
+        }
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    // MARK: Switching databases
+
+    func chooseDatabase() {
+        guard let url = pickDatabase() else { return }
+        switchDatabase(to: url.path)
+    }
+
+    /// `quackd use <db>`: rewrites QUACK_DB and restarts the server if it was started.
+    /// A running server drops its clients on restart, so confirm first.
+    func switchDatabase(to path: String) {
+        guard path != status.db else { return }
+        if status.loaded {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Serve \((path as NSString).lastPathComponent)?"
+            alert.informativeText = "The quack server will restart with this database. "
+                + "Clients connected to \((status.db as NSString).lastPathComponent) will be disconnected."
+            alert.addButton(withTitle: "Switch and Restart")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        rememberDatabase(path)
+        perform(["use", path])
+    }
+
+    /// Recent databases that still exist, for the menu.
+    var availableRecents: [String] {
+        recentDatabases.filter { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    /// Menu title for a database: its file name, plus its folder when two recents share a name.
+    func displayName(_ path: String) -> String {
+        let name = (path as NSString).lastPathComponent
+        let sameName = availableRecents.filter { ($0 as NSString).lastPathComponent == name }
+        guard sameName.count > 1 else { return name }
+        let folder = ((path as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath
+        return "\(name) — \(folder)"
+    }
+
+    func clearRecentDatabases() {
+        recentDatabases = status.db.isEmpty ? [] : [status.db]
+        UserDefaults.standard.set(recentDatabases, forKey: "recentDatabases")
+    }
+
+    private func rememberDatabase(_ path: String) {
+        guard recentDatabases.first != path else { return }
+        recentDatabases = Array(([path] + recentDatabases.filter { $0 != path }).prefix(maxRecents))
+        UserDefaults.standard.set(recentDatabases, forKey: "recentDatabases")
     }
 
     func copyConnectCommand() {
@@ -396,6 +461,9 @@ struct MenuContent: View {
         if let detail = controller.detailLine {
             Text(detail).lineLimit(3)
         }
+        if controller.status.configured {
+            databaseMenu(idle: idle)
+        }
         Divider()
 
         switch phase {
@@ -430,6 +498,24 @@ struct MenuContent: View {
         Button("Quackd \(controller.appVersion) on GitHub…") { controller.openProjectPage() }
         Button("Quit Quackd Menu") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    /// "Database: x.duckdb ▸" with recent databases (current one checked) and a file picker.
+    @ViewBuilder
+    private func databaseMenu(idle: Bool) -> some View {
+        let current = controller.status.db
+        Menu("Database: \((current as NSString).lastPathComponent)") {
+            ForEach(controller.availableRecents, id: \.self) { path in
+                Toggle(controller.displayName(path), isOn: Binding(
+                    get: { path == current },
+                    set: { _ in controller.switchDatabase(to: path) }))
+            }
+            Divider()
+            Button("Choose Database…") { controller.chooseDatabase() }
+            Button("Clear Recent Databases") { controller.clearRecentDatabases() }
+                .disabled(controller.availableRecents.count <= 1)
+        }
+        .disabled(!idle)
     }
 }
 

@@ -77,6 +77,31 @@ check "install writes a valid plist" bash -c "/bin/bash '$QUACKD' install >/dev/
 check "plist passes the overridden dirs to the service" bash -c \
   "[[ \"\$(plutil -extract EnvironmentVariables.QUACKD_STATE_DIR raw -o - '$QUACKD_STATE_DIR/$QUACKD_LABEL.plist')\" == '$QUACKD_STATE_DIR' ]]"
 
+# use: switch databases by rewriting only the QUACK_DB line.
+check "use with no argument prints the current database" test "$(q use)" = "$DB"
+# shellcheck disable=SC2016
+check "status --porcelain reports the database" bash -c '/bin/bash "$QUACKD" status --porcelain | grep -qxF "db=$DB"'
+printf 'not a database, just some text\n' >"$TMP/notes.txt"
+out="$(q use "$TMP/notes.txt" 2>&1)"; rc=$?
+if (( rc != 0 )) && contains "$out" "not a DuckDB database"; then pass "use rejects a file that isn't a DuckDB database"; else fail "use rejects a file that isn't a DuckDB database" "$out"; fi
+out="$(q use "$TMP/missing.duckdb" 2>&1)"; rc=$?
+if (( rc != 0 )) && contains "$out" "database not found"; then pass "use rejects a missing database"; else fail "use rejects a missing database" "$out"; fi
+# shellcheck disable=SC2089,SC2090  # the literal $ \ and " are the point of the test
+DB2="$TMP/other \$db \\ \"two\".duckdb"
+: >"$DB2"
+token_before="$(grep '^QUACK_TOKEN=' "$QUACKD_CONFIG_DIR/config")"
+out="$(q use "$DB2" 2>&1)"; rc=$?
+if (( rc == 0 )) && contains "$out" "Now serving"; then pass "use switches to another database"; else fail "use switches to another database" "$out"; fi
+# shellcheck disable=SC2090
+export DB2
+# shellcheck disable=SC2016
+check "use round-trips a path with \$ \\ and quotes" bash -c 'source "$QUACKD_CONFIG_DIR/config"; [[ "$QUACK_DB" == "$DB2" ]]'
+check "use keeps the rest of the config" test "$(grep '^QUACK_TOKEN=' "$QUACKD_CONFIG_DIR/config")" = "$token_before"
+check "use keeps the config mode 600" test "$(stat -f %Lp "$QUACKD_CONFIG_DIR/config")" = "600"
+check "use of the same database is a no-op" bash -c "/bin/bash '$QUACKD' use \"\$DB2\" | grep -q 'Already serving'"
+check "use leaves no temp files behind" test -z "$(find "$QUACKD_CONFIG_DIR" -name '.config.*')"
+q use "$DB" >/dev/null
+
 # connect: the printed command must survive a round trip through the shell.
 cat >"$QUACKD_CONFIG_DIR/config" <<EOF
 QUACK_DB=$(printf '%q' "$DB")
