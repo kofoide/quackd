@@ -21,27 +21,42 @@ Pushing the tag runs [`.github/workflows/release.yml`](../.github/workflows/rele
 - runs the lint and tests
 - builds `quackd`, `Quackd-X.Y.Z.zip` (a universal, ad-hoc-signed app), and `SHA256SUMS`
 - publishes them as a GitHub Release, with instructions for opening the unsigned app
+- updates the Homebrew tap (next section)
 
-## 3. Update the Homebrew tap
+Follow it on the repository's **Actions** tab, or with `gh run watch`.
 
-The CLI formula lives in a separate repository, **`kofoide/homebrew-tap`**, at `Formula/quackd.rb`. The template is [`packaging/homebrew/quackd.rb`](../packaging/homebrew/quackd.rb).
+## 3. The Homebrew tap (automatic)
 
-1. Get the checksum of GitHub's source tarball for the tag:
-   ```sh
-   curl -sL https://github.com/kofoide/quackd/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256
-   ```
-2. In the tap repository, update `url` (the version in the tag) and `sha256`, then commit and push.
-3. Check it:
-   ```sh
-   brew update && brew upgrade quackd    # or: brew install kofoide/tap/quackd
-   brew test quackd && brew audit --strict kofoide/tap/quackd
-   ```
+The formula (`Formula/quackd.rb`, the CLI) and the cask (`Casks/quackd-menu.rb`, the app) live only in the separate repository **`kofoide/homebrew-tap`**. After publishing, the release workflow runs [`scripts/update-tap.sh`](../scripts/update-tap.sh), which sets the new version and both checksums, then commits `quackd X.Y.Z` to the tap and pushes. You don't edit anything.
 
-### One-time tap setup
+Once the workflow finishes, check it:
+```sh
+brew update
+brew upgrade quackd && brew upgrade --cask quackd-menu
+quackd version
+```
 
+### If the tap step fails or was skipped
+The release itself is already published. Look at the **Update Homebrew tap** step in the run's log. Usually the token has expired; see below. To update the tap by hand instead:
+```sh
+cd ~/projects/homebrew-tap && git pull
+~/projects/quack/scripts/update-tap.sh . X.Y.Z
+git diff                                  # check the version and two sha256 lines
+git commit -am "quackd X.Y.Z" && git push
+```
+
+### The token
+The workflow pushes to the tap with the repository secret **`HOMEBREW_TAP_TOKEN`**. The workflow's built-in token can only write to `quackd` itself.
+- **What it is:** a fine-grained personal access token from GitHub → Settings → Developer settings → Fine-grained tokens. It has access to **only `homebrew-tap`**, with **Contents: Read and write**.
+- **Where it goes:** `quackd` → Settings → Secrets and variables → Actions → **`HOMEBREW_TAP_TOKEN`**.
+- **Renewing it:** fine-grained tokens expire, a year at most. When it does, the step fails with an authentication error. Generate a new token, replace the secret's value, and update the tap by hand for that release.
+
+If the secret isn't set at all, the step is skipped with a warning.
+
+### Setting up a tap from scratch
 1. Create a public GitHub repository named **`homebrew-tap`** under `kofoide`. Homebrew requires the `homebrew-` prefix.
-2. Copy `packaging/homebrew/quackd.rb` to `Formula/quackd.rb` in that repository, and fill in `sha256` as above.
-3. Users can now run `brew install kofoide/tap/quackd`.
+2. Add `Formula/quackd.rb` and `Casks/quackd-menu.rb`. Copy them from the current tap, since that's the only copy.
+3. Create the token and secret as above.
 
 ## Signing and notarization (optional, later)
 

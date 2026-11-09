@@ -10,7 +10,7 @@ This is a guide to the inside of quackd, function by function: the [`bin/quackd`
 | `app/` | The menu bar app: `QuackdMenu.swift`, the `Info.plist` template, and `build.sh`. |
 | `tests/run.sh` | Test suite (`make test`). |
 | `Makefile` | Install, build, test, lint, and release targets. |
-| `packaging/homebrew/quackd.rb` | Template for the Homebrew formula in `kofoide/homebrew-tap`. |
+| `scripts/update-tap.sh` | Points the Homebrew tap (`kofoide/homebrew-tap`) at a release. The release workflow runs it, and you can run it by hand. |
 | `.github/workflows/` | `ci.yml` (every push) and `release.yml` (version tags). |
 | `docs/` | This file, and `releasing.md`. |
 
@@ -378,7 +378,21 @@ Everything runs against a temporary folder and the label `net.kofoid.quackd-test
 
 ### CI and releases
 - **`ci.yml`:** on every push and pull request, it installs `shellcheck` and `duckdb` with Homebrew, then runs `make lint`, `make test`, and `make app`.
-- **`release.yml`:** on a `v*` tag, it checks that the tag matches `QUACKD_VERSION`, runs lint and tests, runs `make dist`, and publishes a GitHub Release with the artifacts.
+- **`release.yml`:** on a `v*` tag, it checks that the tag matches `QUACKD_VERSION`, runs lint and tests, runs `make dist`, and publishes a GitHub Release with the artifacts. Then it updates the Homebrew tap:
+  1. Clones `kofoide/homebrew-tap` using the `HOMEBREW_TAP_TOKEN` secret. The workflow's own token can't push to another repository.
+  2. Runs `scripts/update-tap.sh`.
+  3. Commits `quackd X.Y.Z` as `github-actions[bot]` and pushes.
+
+  If the secret is missing, it skips the tap with a warning. Because this step comes after publishing, a failure here never blocks the release.
+
+### `scripts/update-tap.sh <tap-dir> <version> [<zip>]`
+Edits a checkout of the tap. It doesn't commit.
+- **Formula** (`Formula/quackd.rb`): sets `url` to the tag's source tarball, and `sha256` to the checksum of that tarball as GitHub serves it, which is exactly what `brew install` downloads and checks.
+- **Cask** (`Casks/quackd-menu.rb`, if present): sets `version`, and `sha256` to the checksum of the app zip. The workflow passes the zip it just built. Without one, the script reads the release's `SHA256SUMS`.
+
+It replaces whole lines, matched by their two-space indent, then checks that each new line is really there and that `ruby -c` still parses the file. It stops with a clear message if the tag or release doesn't exist yet. Run on a tap that's already up to date, it changes nothing.
+
+The formula and cask live only in the tap. Keeping a copy in this repository would always be one release behind, because the checksum can only be computed after the tag is pushed.
 
 See [releasing.md](releasing.md) for the full checklist.
 

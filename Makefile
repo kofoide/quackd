@@ -14,7 +14,7 @@ BINDIR  ?= $(PREFIX)/bin
 APPDIR  ?= $(HOME)/Applications
 BUILD   := build
 VERSION := $(shell sed -n 's/^QUACKD_VERSION="\(.*\)"$$/\1/p' bin/quackd)
-SHELL_SCRIPTS := bin/quackd app/build.sh tests/run.sh
+SHELL_SCRIPTS := bin/quackd app/build.sh tests/run.sh scripts/update-tap.sh
 
 .PHONY: help install uninstall app install-app uninstall-app test lint dist clean version
 
