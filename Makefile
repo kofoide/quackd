@@ -37,7 +37,7 @@ app:
 	app/build.sh "$(BUILD)"
 
 install-app: app
-	-pkill -x QuackdMenu
+	-pkill -x QuackdMenu || true
 	install -d "$(APPDIR)"
 	rm -rf "$(APPDIR)/Quackd.app"
 	cp -R "$(BUILD)/Quackd.app" "$(APPDIR)/Quackd.app"
@@ -45,7 +45,7 @@ install-app: app
 	@echo "Installed and opened $(APPDIR)/Quackd.app"
 
 uninstall-app:
-	-pkill -x QuackdMenu
+	-pkill -x QuackdMenu || true
 	rm -rf "$(APPDIR)/Quackd.app"
 
 test:

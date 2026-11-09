@@ -42,8 +42,9 @@ The script runs under macOS's built-in `/bin/bash`, version 3.2. Its first line 
 | `~/Library/Application Support/quackd/` | `STATE_DIR` | Holds the plist and the failure count. |
 | `STATE_DIR/net.kofoid.quackd.plist` | `PLIST` | The launchd job definition. It's kept out of `~/Library/LaunchAgents` so it doesn't start at login. |
 | `STATE_DIR/net.kofoid.quackd.failures` | `FAIL_FILE` | A single number: how many failed starts in a row. It's named after the label, so separate services keep separate counts. |
+| `STATE_DIR/net.kofoid.quackd.clients` | `CLIENTS_FILE` | The running server's open connections, rewritten every `TICK` (2) seconds: one CSV line per connection with its ID, client ID, state, and last query time. It's deleted when the server exits. |
 | `STATE_DIR/quackd` | — | The app's installed copy of the script. The script itself never writes it. |
-| `~/Library/Logs/quackd/quackd.log` | `LOG_FILE` | Everything the service prints to stdout or stderr. |
+| `~/Library/Logs/quackd/quackd.log` | `LOG_FILE` | Everything the service prints to stdout or stderr. Rotated copies are `quackd.log.1`, `.2`, and so on, with `.1` the newest. |
 | `~/Library/LaunchAgents/net.kofoid.quackd.plist` | `LEGACY_PLIST` | Where an early version put the plist. It's only ever deleted, never written. |
 
 Each location can be overridden with an environment variable: `QUACKD_CONFIG_DIR`, `QUACKD_STATE_DIR`, `QUACKD_LOG_DIR`, and `QUACKD_LABEL`. The plist passes all four to the service, so `run` sees the same values as the command that installed it. The tests use them to run in temporary folders under a test label.
@@ -118,6 +119,14 @@ Writes the launchd job file. The important keys:
 
 Every value goes through `xml_escape`.
 
+### `rotate_log_if_needed`
+Rotates the log once it reaches `QUACK_LOG_MAX_MB` megabytes (default 10; `0` turns rotation off):
+1. It shifts the older copies up: `quackd.log.2` becomes `.3`, then `.1` becomes `.2`, keeping `QUACK_LOG_KEEP` (default 3).
+2. It copies the log to `quackd.log.1`.
+3. It empties the log in place and writes a `log rotated` line at the top.
+
+**Why copy and empty instead of renaming:** launchd and DuckDB hold the log file open, and they'd keep writing into a renamed file. launchd opens it in append mode, so after it's emptied, their next writes land at the top of the file with no gap. Lines written during the copy itself can be lost. `cmd_run` calls this before its first log line and then every `TICK` seconds.
+
 ### `notify <title> <message>`
 Shows a macOS notification. It's used only by `on_run_exit`. If `QUACK_NOTIFY` isn't `true`, it does nothing. It tries three methods in order:
 1. **Quackd.app.** It runs `open -g "quackd://notify?title=…&message=…"`. If the app is installed, it has registered the `quackd://` URL scheme, so macOS hands it the link, launching the app if needed. The app posts the notification under its own name, and clicking it opens the log. If no app handles the scheme, `open` fails immediately, so the script moves on.
@@ -189,6 +198,7 @@ The same information in a form that's easy for programs to read: one `key=value`
   - `duckdb`: the DuckDB path that was found, empty if none.
   - `service_script`: the script path recorded in the installed plist.
 - **Database:** `db`, the `QUACK_DB` path. It's empty if the config doesn't load.
+- **Clients:** `connections`, the number of open connections from `CLIENTS_FILE`. It's empty when unknown, meaning the server isn't running.
 
 To get `config_error`, it runs `load_config` in a subshell and captures what `die` prints.
 
@@ -198,36 +208,57 @@ Unlike the normal output, `failures` is always included, and the program reading
 Splits `QUACK_LISTEN` (`quack:host[:port]`) into `LISTEN_HOST` and `LISTEN_PORT`. The port defaults to 9494. It's used by `status`, `status --porcelain`, and `connect`.
 
 ### `cmd_connect` (`quackd connect`)
-Prints a ready-to-paste command: `duckdb -cmd "INSTALL quack; LOAD quack; ATTACH 'quack:host:port' AS remotedb (TOKEN '…');"`. The address and token are quoted for SQL with `sql_quote`.
+Prints a ready-to-paste command: `duckdb -cmd "INSTALL quack; LOAD quack; ATTACH 'quack:host:port' AS <name> (TOKEN '…');"`. The address and token are quoted for SQL with `sql_quote`. `<name>` comes from `connect_alias`.
+
+### `connect_alias`
+Picks the name the client attaches the server as: the database's file name with its last extension removed, so `sales.duckdb` becomes `sales`. It's turned into a plain identifier, so the command never needs extra quoting:
+- **Other characters:** anything that isn't a letter, digit, or `_` becomes `_`. It works byte by byte, so an accented letter becomes two `_`.
+- **Leading digit:** gets `_` in front, so `2026.duckdb` becomes `_2026`.
+- **Names DuckDB refuses:** a reserved word gets `_db` added (`select` becomes `select_db`). It finds those by asking DuckDB's `duckdb_keywords()`. So do the built-in database names `memory`, `system`, `temp`, and `main`.
+- **Nothing left:** for a file named just `.duckdb`, it falls back to `remotedb`.
 
 If the result contains characters that are special inside double quotes (`"`, `$`, `` ` ``, `\`, or `!`), it uses `printf %q` to escape the whole argument for the shell instead. That looks messier, but it pastes correctly.
+
+### `fresh_clients`, `connection_count`
+`fresh_clients` prints `CLIENTS_FILE` if it was written in the last 10 seconds (five ticks), and fails otherwise. A missing or stale file means the server isn't running: it deletes the file on exit, and a hard crash leaves it stale. `connection_count` turns that into a number. `status`, `status --porcelain`, and `clients` all use these, without asking launchd, so they also work for a server started with `quackd run`.
+
+### `cmd_clients` (`quackd clients`)
+Lists the open connections in a table (connection ID, client ID, state, and last query time), or says nobody is connected or that the server isn't running. IDs are shortened to 8 characters, like in the log. One client process usually has one connection per `ATTACH`.
+
+### `cmd_activity` (`quackd activity [N]`)
+Prints the last N (default 10) event lines from the log: accepted, rejected, and closed connections, plus starts, stops, crashes, failures, and giving up. It reads the end of `quackd.log.1` as well, so a fresh rotation doesn't come up empty. With `QUACK_LOG=all`, connections are raw DuckDB rows that don't match, so only starts and stops appear.
 
 ### `version`
 `quackd version` (or `--version`, or `-v`) prints `quackd X.Y.Z`. It's handled directly in the dispatch `case`.
 
 ### `cmd_logs` (`quackd logs`)
-Shows the last 50 lines of the log and keeps following it, like `tail -f`.
+Shows the last 50 lines of the log and keeps following it. It uses `tail -F`, which notices when the log is rotated and carries on with the emptied file.
 
 ### `cmd_run` (`quackd run`)
 The service itself. launchd runs this, and you can also run it in a terminal to debug. In order:
 
 1. **Set up failure handling.** It sets `RUN_MODE`, records the start time, and registers `on_run_exit` to run however the script exits, whether through `die`, a failing command, or the normal end.
-2. **Check the config** and that the database file exists.
+2. **Check the config** and that the database file exists. Then it deletes any leftover `CLIENTS_FILE` and rotates the log if it's over the size limit, so the start line lands in the fresh log.
 3. **Build the startup SQL.** That's `call quack_serve('<listen>', token='<token>'[, extra args]);`, with values quoted by `sql_quote`.
 4. **Create a FIFO that never reaches end-of-file.** This is the core trick. `quack_serve()` returns right away and serves from a background thread, and the `duckdb` command-line tool exits as soon as its input runs out. The script creates a named pipe, opens it for reading *and* writing on file descriptor 3, and deletes the name. Because the same descriptor keeps the pipe open for writing, DuckDB never sees the input end and simply waits forever.
 5. **Choose the logging mode** from `QUACK_LOG`. For `connections` and `all`, it adds `CALL enable_logging(['Quack'], level='debug', storage='stdout');`.
 6. **Write the startup commands into the FIFO:**
    - `.bail on` makes DuckDB exit if a command fails, so a failed `quack_serve` turns into a restart instead of a process that's alive but not serving.
    - `.output /dev/null` … `.output` hides the output of those commands. `quack_serve` prints the token in its result table, and this keeps it out of the log.
+   - `.bail off` comes last. From here on, a failing command (such as a connection snapshot) only logs an error and can't stop the server.
 
    The SQL goes in through the pipe rather than as a command-line argument, so the token doesn't appear in `ps`.
 7. **Start DuckDB as a child process**, with the FIFO as its input:
    - In `connections` mode, DuckDB's output goes through a second, temporary FIFO into `format_connection_log`, which runs as a separate background process. The script keeps both process IDs.
    - In `all` or `off` mode, DuckDB's output goes straight to the log.
 
-   Then it closes its own copy of descriptor 3. DuckDB holds its own copy, opened for reading and writing, so it still never sees the input end.
+   The script keeps its own copy of descriptor 3 open, so it can send DuckDB more commands later.
 8. **Pass shutdown signals on.** On TERM, INT, or HUP, it records which signal arrived and sends SIGTERM to DuckDB.
-9. **Wait for DuckDB to exit.** A signal interrupts bash's `wait`, so it loops until the process is really gone and keeps its exit code. It then waits for the log filter, so the filter's last lines are written before the final message.
+9. **Tick until DuckDB exits.** Every `TICK` (2) seconds it:
+   - writes a `COPY (… FROM quack_active_connections()) TO '<CLIENTS_FILE>'` statement into descriptor 3. The server writes its own connection list, which is cheaper than connecting as a client, and doesn't add a connection to the log every two seconds. The times are converted from UTC to local time, to match the log.
+   - calls `rotate_log_if_needed`.
+
+   **The sleep runs in the background, and the script `wait`s for it.** A trapped signal interrupts `wait` right away, but not a foreground `sleep`, so a stop is never delayed. After a signal it stops ticking and just waits for DuckDB to shut down. A crash is noticed within one tick. bash remembers a finished child's exit code, so the final `wait` still gets it. Then it waits for the log filter, so the filter's last lines are written before the final message.
 10. **Log how it ended:**
     - It was stopped by a signal: logs `quack server stopped (received SIGTERM)` and exits 0.
     - DuckDB exited on its own: logs `quack server exited unexpectedly (exit code N)` and exits with that code. If DuckDB somehow exited with 0, it exits 1, so an unexpected exit is never treated as a clean stop.
@@ -290,9 +321,11 @@ An invalid `QUACK_MAX_FAILURES` falls back to 5, and `0` means retry forever.
   - **`setUp()`** handles first-run setup. An open panel picks the database, then the app runs `quackd init <db>` and `quackd install`.
   - **Switching databases:**
     - **Picking a file:** `chooseDatabase()` opens the same file picker, starting in the current database's folder.
-    - **Switching:** `switchDatabase(to:)` runs `quackd use <db>`. If the server is loaded, it first asks for confirmation, because the restart disconnects clients.
+    - **Switching:** `switchDatabase(to:)` runs `quackd use <db>`.
     - **Recents:** `recentDatabases` holds up to 8 databases, newest first, in `UserDefaults`. Every database the app sees in `status` is added, including ones switched from the CLI. Files that no longer exist are hidden, and `displayName` adds the folder when two recents share a file name.
   - **Menu actions:** `copyConnectCommand()`, `openLog()`, `openConfig()`, `openDuckDBInstallPage()`, and `openProjectPage()`.
+  - **Asking before disconnecting clients:** `stopServer()`, `restartServer()`, and `switchDatabase(to:)` call `confirmDisconnect` first. It asks only when the server is running and `connections` is above 0, and says how many clients would be cut off.
+  - **Activity:** each `refresh()` also runs `quackd activity 8`, and stores the lines newest first in `activity`. `activityTitle` shortens them for the menu: it drops today's date and condenses the long messages. For example, `starting quack server: db=/…/q.duckdb listen=…` becomes `started (q.duckdb)`.
   - **Login item:** `setOpenAtLogin` registers or removes the *app* as a login item with `SMAppService.mainApp`. It never affects the server.
   - **Display:** `iconName`, `statusLine`, and `detailLine` map the phase to an SF Symbol and the text at the top of the menu. `detailLine` explains a missing DuckDB or a broken config.
 - **`MenuContent`** is the menu. The action section depends on the phase:
@@ -301,7 +334,7 @@ An invalid `QUACK_MAX_FAILURES` falls back to 5, and `0` means retry forever.
   - **Not installed:** "Install Service"
   - **Otherwise:** Start, Stop, and Restart, each disabled when it doesn't apply.
 
-  Once configured, a **Database: *name*** submenu sits under the status line. It lists the recent databases, with the current one checked, followed by Choose Database… and Clear Recent Databases.
+  While running, the menu shows how many clients are connected. Once configured, a **Database: *name*** submenu sits under the status line, followed by **Recent Activity**, which lists the last 8 events, newest first, with an Open Log item at the bottom. The Database submenu lists the recent databases, with the current one checked, followed by Choose Database… and Clear Recent Databases.
 
   The menu ends with the version, which links to the GitHub page.
 - **`QuackdMenuApp`** is the entry point: a `MenuBarExtra` with `.menu` style, and `AppDelegate` attached through `@NSApplicationDelegateAdaptor`.
@@ -329,6 +362,9 @@ Everything runs against a temporary folder and the label `net.kofoid.quackd-test
   - `sql_quote`, `urlencode`, and `xml_escape`, which are loaded straight from the script with `grep`
   - `init`: errors, a path with spaces and quotes, file mode 600, refusing to overwrite
   - every porcelain key is present
+  - log rotation, through the integration server: an oversized log rotates at start, `.1` shifts to `.2`, and the new log starts fresh
+  - `clients` with zero and one connected client, and the porcelain `connections` count
+  - `activity`: events only, newest last, the N limit, and rejecting bad input
   - `use`: printing the current database, rejecting missing and non-DuckDB files, a path with `$`, `\`, and `"`, leaving the token and file mode alone, no-op on the same database, no leftover temp files
   - `install` writes a valid plist
   - `connect` output round-trips through the shell

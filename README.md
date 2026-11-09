@@ -69,10 +69,10 @@ quackd connect                 # prints a ready-to-run duckdb command
 `quackd connect`, or the menu's **Copy DuckDB Connect Command**, prints something like:
 
 ```sh
-duckdb -cmd "INSTALL quack; LOAD quack; ATTACH 'quack:localhost:9494' AS remotedb (TOKEN '…');"
+duckdb -cmd "INSTALL quack; LOAD quack; ATTACH 'quack:localhost:9494' AS sales (TOKEN '…');"
 ```
 
-Then query `remotedb` like a local database. To use DuckDB's web UI, add `CALL start_ui();` at the end of the `-cmd` string. Keep that terminal open, because the UI runs inside that `duckdb` process.
+The attached database is named after the served file without its extension, so `sales.duckdb` becomes `sales`. Query it like a local database, for example `SELECT * FROM sales.orders`. Characters that aren't letters, digits, or `_` become `_`, so `My Data.duckdb` becomes `My_Data`. A name DuckDB doesn't allow, like `select`, gets `_db` added. To use DuckDB's web UI, add `CALL start_ui();` at the end of the `-cmd` string. Keep that terminal open, because the UI runs inside that `duckdb` process.
 
 ## Commands
 
@@ -84,6 +84,8 @@ Then query `remotedb` like a local database. To use DuckDB's web UI, add `CALL s
 | `quackd start` / `stop` / `restart` | Control the server. `restart` also applies a reinstalled service file. |
 | `quackd status` | launchd state, failure count, and whether the port is accepting connections. `--porcelain` gives stable `key=value` output for scripts. |
 | `quackd connect` | Print a `duckdb` command that attaches to the server. |
+| `quackd clients` | List the clients connected right now. |
+| `quackd activity [N]` | The last N (default 10) connections, rejections, starts, and stops from the log. |
 | `quackd logs` | Follow the log. |
 | `quackd uninstall` | Stop the server and remove the service. Keeps your config and log. |
 | `quackd run` | Run the server in the foreground. This is what launchd runs, and it's useful for debugging. |
@@ -99,7 +101,9 @@ Then query `remotedb` like a local database. To use DuckDB's web UI, add `CALL s
 | warning triangle | Gave up after repeated failures, DuckDB isn't installed, or status is unavailable |
 
 The menu offers Start, Stop, and Restart, plus:
-- **Database**: switch which database is served. It lists the databases you've used recently, with the current one checked, and **Choose Database…** to pick another file. If the server is running, it asks before restarting it, because connected clients get disconnected.
+- **How many clients are connected**, shown under the status while the server runs. Stop, Restart, and switching databases ask first if anyone is connected.
+- **Database**: switch which database is served. It lists the databases you've used recently, with the current one checked, and **Choose Database…** to pick another file. A running server restarts with the new database.
+- **Recent Activity**: the last few connections, rejections, starts, and stops.
 - **Copy DuckDB Connect Command**
 - **Open Log**, which opens the log in Console
 - **Edit Config**
@@ -119,6 +123,8 @@ The app contains its own copy of `quackd` and runs it for every action, so the m
 | `QUACK_LISTEN` | `quack:localhost` | Address to listen on. The default port is 9494, e.g. `quack:localhost:9500`. |
 | `QUACK_TOKEN` | random | Clients must send this to connect. At least 4 characters. |
 | `QUACK_LOG` | `connections` | `connections`: one line per connect or disconnect. `all`: raw DuckDB log rows, including each query's SQL. `off`: no client logging. |
+| `QUACK_LOG_MAX_MB` | `10` | Rotate the log when it reaches this many megabytes. `0` never rotates. |
+| `QUACK_LOG_KEEP` | `3` | How many rotated logs to keep: `quackd.log.1` (newest) to `quackd.log.3`. |
 | `QUACK_MAX_FAILURES` | `5` | Stop retrying after this many failed starts in a row. `0` retries forever. |
 | `QUACK_NOTIFY` | `true` | Notify on the first crash and when it gives up. |
 | `DUCKDB_BIN` | auto-detected | Path to `duckdb`. |
@@ -151,7 +157,7 @@ After `QUACK_MAX_FAILURES` failures in a row, it stops retrying until you run `q
 
 You get **one notification on the first failure and one if it gives up**, not one per retry. If Quackd.app is installed, notifications come from it, and clicking one opens the log. Without the app, quackd uses `terminal-notifier` if you have it, and otherwise macOS's built-in `osascript`. macOS lists `osascript` notifications under **Script Editor** in System Settings → Notifications, and they only appear once Script Editor is allowed there. If you see nothing, open Script Editor, run `display notification "test"` once, and click Allow.
 
-The log doesn't rotate. With `QUACK_LOG=all` it grows quickly.
+When the log reaches `QUACK_LOG_MAX_MB` (10 MB by default), it's rotated: the old contents move to `quackd.log.1`, and older copies shift to `.2` and `.3`. With `QUACK_LOG=all`, which logs every query, it fills up much faster.
 
 ## Security notes
 

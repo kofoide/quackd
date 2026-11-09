@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.6.0] - 2026-11-09
+
+### quackd (CLI)
+- New `quackd clients` lists the connected clients. `status` shows the count, and `status --porcelain` has a new `connections` key. The running server takes a snapshot of its own connections every 2 seconds, so checking doesn't add connections to the log.
+- `quackd connect` names the attached database after the served file (`sales.duckdb` → `sales`) instead of `remotedb`. Names that aren't valid identifiers are adjusted, for example `My Data.duckdb` → `My_Data` and `select.duckdb` → `select_db`.
+- New `quackd activity [N]` shows recent connections, rejections, starts, and stops from the log.
+- The log now rotates when it reaches `QUACK_LOG_MAX_MB` (default 10), keeping `QUACK_LOG_KEEP` old copies (default 3). `quackd logs` keeps following across rotations.
+
+### Quackd.app (menu bar)
+- Shows how many clients are connected. Stop, Restart, and switching databases ask first when clients would be disconnected, and no longer ask when nobody is connected.
+- New **Recent Activity** submenu.
+
 ## [1.5.0] - 2026-11-09
 
 ### quackd (CLI)

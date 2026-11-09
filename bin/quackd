@@ -10,6 +10,8 @@
 #   status      Show launchd state and whether the port is accepting connections
 #               (--porcelain: stable key=value output for scripts and the menu bar app)
 #   connect     Print a duckdb command that attaches to this server
+#   clients     List the clients connected right now
+#   activity [N]  Show the last N connections, rejections, starts, and stops (default 10)
 #   logs        Tail the server log
 #   run         Run the server in the foreground (what launchd invokes)
 #   version     Print the quackd version
@@ -17,7 +19,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.5.0"
+QUACKD_VERSION="1.6.0"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and
@@ -32,6 +34,9 @@ STATE_DIR="${QUACKD_STATE_DIR:-$HOME/Library/Application Support/quackd}"
 PLIST="$STATE_DIR/$LABEL.plist"
 LEGACY_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 FAIL_FILE="$STATE_DIR/$LABEL.failures"
+# Written by the running server every TICK seconds: one CSV line per open connection.
+CLIENTS_FILE="$STATE_DIR/$LABEL.clients"
+TICK=2
 STABLE_SECONDS=60   # a run that lasted this long resets the consecutive-failure count
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DOMAIN="gui/$(id -u)"
@@ -101,6 +106,8 @@ QUACK_DB=$(printf '%q' "$db")
 QUACK_LISTEN="quack:localhost"        # default port 9494; e.g. quack:localhost:9500
 QUACK_TOKEN="$token"
 # QUACK_LOG="connections"   # connections (default) | all (raw, incl. queries) | off
+# QUACK_LOG_MAX_MB=10       # rotate the log at this size (0 = never)
+# QUACK_LOG_KEEP=3          # rotated logs to keep: quackd.log.1 … .3
 # QUACK_MAX_FAILURES=5      # stop retrying after this many failed starts in a row (0 = never)
 # QUACK_NOTIFY="true"       # macOS notification on first crash and when giving up
 # DUCKDB_BIN="/opt/homebrew/bin/duckdb"
@@ -167,6 +174,9 @@ cmd_run() {
   exec 3<>"$fifo"
   rm -f "$fifo"
 
+  mkdir -p "$STATE_DIR"
+  rm -f "$CLIENTS_FILE"
+  rotate_log_if_needed
   echo "$(ts) starting quack server: db=$QUACK_DB listen=$QUACK_LISTEN"
   # The SQL (with the token) is passed via stdin rather than argv so it doesn't show
   # up in `ps`. .bail on: if quack_serve() fails, exit so launchd retries instead of
@@ -184,7 +194,9 @@ cmd_run() {
     off) ;;
     *) die "QUACK_LOG must be connections, all, or off (got: $mode)" ;;
   esac
-  printf '.bail on\n.output /dev/null\n%s\n%s\n.output\n' "$logging" "$serve" >&3
+  # After startup, .bail off: the periodic snapshot below must never stop the server
+  # just because one of its statements failed.
+  printf '.bail on\n.output /dev/null\n%s\n%s\n.output\n.bail off\n' "$logging" "$serve" >&3
 
   # duckdb runs as a child (not exec'd) so this script can log when it stops. In
   # 'connections' mode its stdout goes through the filter via a second FIFO, so we
@@ -202,7 +214,16 @@ cmd_run() {
     "$DUCKDB_BIN" -no-agent "$QUACK_DB" <&3 &
     child=$!
   fi
-  exec 3>&-
+  # fd 3 stays open: the loop below keeps sending duckdb SQL through it.
+
+  # Every TICK seconds, the server writes its own list of open connections to
+  # CLIENTS_FILE (for `quackd clients` and the menu). Asking the server process
+  # directly avoids opening a client connection, which would show up in the log.
+  local snapshot
+  snapshot="COPY (SELECT left(connection_id, 8), left(client_id_hash, 8), state,"
+  # query_started_at is UTC; timezone('UTC', …) makes strftime print local time like the log.
+  snapshot+=" strftime(timezone('UTC', query_started_at), '%Y-%m-%d %H:%M:%S') FROM quack_active_connections()"
+  snapshot+=" ORDER BY query_started_at) TO $(sql_quote "$CLIENTS_FILE") (FORMAT csv, HEADER false);"
 
   # launchd stops the job with SIGTERM: pass it on to duckdb and remember why.
   local signal=""
@@ -210,12 +231,26 @@ cmd_run() {
   trap 'signal=INT;  kill -TERM "$child" 2>/dev/null' INT
   trap 'signal=HUP;  kill -TERM "$child" 2>/dev/null' HUP
 
-  # `wait` returns early when a trap fires, so keep waiting until duckdb is gone.
-  local rc=0
-  while :; do
-    wait "$child" && rc=0 || rc=$?
-    kill -0 "$child" 2>/dev/null || break
+  # Until duckdb exits: take a snapshot and check the log size every TICK seconds.
+  # The sleep runs in the background because `wait` (unlike a foreground command)
+  # returns as soon as a trap fires, so stopping is never delayed. After a signal,
+  # just wait for duckdb to finish shutting down.
+  local rc=0 sleeper
+  while kill -0 "$child" 2>/dev/null; do
+    if [[ -n "$signal" ]]; then
+      wait "$child" 2>/dev/null || true
+      continue
+    fi
+    printf '%s\n' "$snapshot" >&3
+    rotate_log_if_needed
+    sleep "$TICK" &
+    sleeper=$!
+    wait "$sleeper" 2>/dev/null || true
+    kill "$sleeper" 2>/dev/null || true
   done
+  # bash keeps the exit status of a finished background job until it's waited for.
+  wait "$child" 2>/dev/null && rc=0 || rc=$?
+  exec 3>&-
   [[ -n "$filter_pid" ]] && wait "$filter_pid" 2>/dev/null
 
   if [[ -n "$signal" ]]; then
@@ -233,6 +268,7 @@ cmd_run() {
 on_run_exit() {
   local rc=$1
   trap - EXIT
+  rm -f "$CLIENTS_FILE"
   if (( rc == 0 )); then rm -f "$FAIL_FILE"; exit 0; fi
 
   local max="${QUACK_MAX_FAILURES:-5}" n=0
@@ -265,6 +301,27 @@ on_run_exit() {
 # macOS notification (QUACK_NOTIFY=false disables). Tries, in order: Quackd.app,
 # terminal-notifier (clicking opens the log), then the built-in osascript banner.
 # Never fails the caller: a missing or blocked notification just gets skipped.
+# If the log has reached QUACK_LOG_MAX_MB, rotate it: quackd.log.1 → .2 and so on
+# (keeping QUACK_LOG_KEEP), copy the log to quackd.log.1, then empty it in place.
+# Copy-and-truncate rather than rename, because launchd and duckdb hold the log open:
+# a renamed file would keep receiving their output. launchd opens it in append mode,
+# so after truncation their writes start again at the top. Lines written during the
+# copy itself can be lost.
+rotate_log_if_needed() {
+  local max="${QUACK_LOG_MAX_MB:-10}" keep="${QUACK_LOG_KEEP:-3}" size i
+  [[ "$max" =~ ^[0-9]+$ ]] || max=10
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=3
+  (( max > 0 )) && [[ -f "$LOG_FILE" ]] || return 0
+  size="$(stat -f %z "$LOG_FILE" 2>/dev/null)" || return 0
+  (( size >= max * 1024 * 1024 )) || return 0
+  for (( i = keep - 1; i >= 1; i-- )); do
+    if [[ -f "$LOG_FILE.$i" ]]; then mv -f "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"; fi
+  done
+  if (( keep > 0 )); then cp "$LOG_FILE" "$LOG_FILE.1"; fi
+  : >"$LOG_FILE"
+  echo "$(ts) quackd: log rotated at ${max} MB$( (( keep > 0 )) && echo "; previous log: $LOG_FILE.1")"
+}
+
 notify() {
   [[ "${QUACK_NOTIFY:-true}" == "true" ]] || return 0
   local title="$1" message="$2"
@@ -398,11 +455,14 @@ cmd_restart() {
 
 # Machine-readable status: one key=value per line, values never quoted. Keys:
 # version installed loaded state pid runs last_exit failures max_failures listening
-# host port log config configured config_error duckdb service_script db
+# host port log config configured config_error duckdb service_script db connections
+# (connections is empty when unknown, e.g. the server isn't running)
 # The menu bar app depends on these keys: add new ones freely, don't rename or remove.
 status_porcelain() {
   local info="" state="" pid="" runs="" last_exit="" failures=0 listening=no host="" port=""
   local installed=no loaded=no max="5" configured=no config_error="" service_script="" db=""
+  local connections
+  connections="$(connection_count)" || connections=""
   if [[ -f "$PLIST" ]]; then
     installed=yes
     service_script="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST" 2>/dev/null || true)"
@@ -434,7 +494,7 @@ status_porcelain() {
     "pid=$pid" "runs=$runs" "last_exit=$last_exit" "failures=$failures" "max_failures=$max" \
     "listening=$listening" "host=$host" "port=$port" "log=$LOG_FILE" "config=$CONFIG_FILE" \
     "configured=$configured" "config_error=${config_error//$'\n'/ }" "duckdb=${DUCKDB_BIN:-}" \
-    "service_script=$service_script" "db=$db"
+    "service_script=$service_script" "db=$db" "connections=$connections"
 }
 
 # Split QUACK_LISTEN (quack:host[:port]) into LISTEN_HOST / LISTEN_PORT (default 9494).
@@ -445,17 +505,79 @@ listen_host_port() {
   return 0
 }
 
-# Print a ready-to-paste duckdb command that attaches this server as `remotedb`.
+# The name `connect` attaches the server as: the database's file name without its
+# extension (sales.duckdb → sales), made into a plain SQL identifier so it never
+# needs quoting. Other characters become _, a leading digit gets a _ in front, and
+# names DuckDB won't accept (reserved words like `select`, and the built-in
+# databases memory, system, temp) get _db added. Falls back to remotedb.
+connect_alias() {
+  local name lower reserved
+  name="$(basename "$QUACK_DB")"
+  name="${name%.*}"
+  name="$(printf '%s' "$name" | LC_ALL=C sed 's/[^A-Za-z0-9_]/_/g')"
+  if [[ -z "$name" ]]; then echo remotedb; return; fi
+  if [[ "$name" == [0-9]* ]]; then name="_$name"; fi
+  lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  # Safe to put in SQL as is: it's only letters, digits, and _ by now.
+  reserved="$("$DUCKDB_BIN" -no-agent -noheader -list -c \
+    "SELECT count(*) FROM duckdb_keywords() WHERE keyword_category = 'reserved' AND keyword_name = '$lower'" \
+    2>/dev/null || echo 0)"
+  case "$lower" in memory|system|temp|main) reserved=1 ;; esac
+  if [[ "$reserved" != "0" ]]; then name+="_db"; fi
+  echo "$name"
+}
+
+# Print a ready-to-paste duckdb command that attaches this server, named after the
+# database file (see connect_alias).
 cmd_connect() {
   load_config
   listen_host_port
   local sql
-  sql="INSTALL quack; LOAD quack; ATTACH $(sql_quote "quack:$LISTEN_HOST:$LISTEN_PORT") AS remotedb (TOKEN $(sql_quote "$QUACK_TOKEN"));"
+  sql="INSTALL quack; LOAD quack; ATTACH $(sql_quote "quack:$LISTEN_HOST:$LISTEN_PORT") AS $(connect_alias) (TOKEN $(sql_quote "$QUACK_TOKEN"));"
   if [[ "$sql" == *[\"\$\`\\!]* ]]; then
     printf 'duckdb -cmd %q\n' "$sql"   # token has shell-special characters: fully escape
   else
     printf 'duckdb -cmd "%s"\n' "$sql"
   fi
+}
+
+# Print the connections from CLIENTS_FILE, or nothing (exit 1) when there's no
+# current snapshot: the server isn't running, or it stopped without cleaning up.
+fresh_clients() {
+  [[ -f "$CLIENTS_FILE" ]] || return 1
+  local age=$(( $(date +%s) - $(stat -f %m "$CLIENTS_FILE" 2>/dev/null || echo 0) ))
+  (( age <= TICK * 5 )) || return 1
+  cat "$CLIENTS_FILE"
+}
+
+# Number of open connections, or nothing (exit 1) when unknown.
+connection_count() {
+  local list
+  list="$(fresh_clients)" || return 1
+  if [[ -z "$list" ]]; then echo 0; else printf '%s\n' "$list" | wc -l | tr -d ' '; fi
+}
+
+cmd_clients() {
+  local list n
+  list="$(fresh_clients)" || { echo "The quack server isn't running."; return 0; }
+  n="$(connection_count)"
+  if (( n == 0 )); then echo "No clients connected."; return 0; fi
+  if (( n == 1 )); then echo "1 connection:"; else echo "$n connections:"; fi
+  printf '  %-12s %-10s %-10s %s\n' CONNECTION CLIENT STATE "LAST QUERY"
+  printf '%s\n' "$list" | awk -F, '{ printf "  %-12s %-10s %-10s %s\n", $1, $2, $3, $4 }'
+}
+
+# The last N connection and lifecycle lines from the log (and the previous log, so a
+# fresh rotation doesn't come up empty). In QUACK_LOG=all mode, connections are raw
+# DuckDB rows, so only starts and stops show up here.
+cmd_activity() {
+  local n="${1:-10}"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "usage: quackd activity [N]"
+  {
+    if [[ -f "$LOG_FILE.1" ]]; then tail -n 2000 "$LOG_FILE.1"; fi
+    if [[ -f "$LOG_FILE" ]]; then tail -n 5000 "$LOG_FILE"; fi
+  } | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} (connection accepted|connection REJECTED|disconnected|starting quack server|quack server stopped|quack server exited|quackd: failure|quackd: giving up)' \
+    | tail -n "$n" || true
 }
 
 cmd_status() {
@@ -480,12 +602,14 @@ cmd_status() {
   echo "  database: $QUACK_DB"
   if nc -z -G 2 "$host" "$port" 2>/dev/null; then
     echo "  listening: yes ($host:$port)"
+    local n
+    if n="$(connection_count)"; then echo "  connections: $n"; fi
   else
     echo "  listening: no ($host:$port)"
   fi
 }
 
-cmd_logs() { mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; tail -n 50 -f "$LOG_FILE"; }
+cmd_logs() { mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; tail -n 50 -F "$LOG_FILE"; }
 
 case "${1:-}" in
   init) cmd_init "${2:-}" ;;
@@ -498,6 +622,8 @@ case "${1:-}" in
   restart) cmd_restart ;;
   status) cmd_status "${2:-}" ;;
   connect) cmd_connect ;;
+  clients) cmd_clients ;;
+  activity) cmd_activity "${2:-}" ;;
   logs) cmd_logs ;;
   run) cmd_run ;;
   *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; exit 1 ;;

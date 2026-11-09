@@ -36,6 +36,7 @@ struct ServiceStatus: Equatable {
     var duckdb = ""
     var serviceScript = ""  // script path recorded in the installed launchd plist
     var db = ""             // database being served (QUACK_DB); empty if not configured
+    var connections: Int?   // open client connections; nil when unknown (not running)
     var error: String?      // set when the status command itself failed
 
     enum Phase {
@@ -78,6 +79,7 @@ struct ServiceStatus: Equatable {
             case "duckdb": s.duckdb = value
             case "service_script": s.serviceScript = value
             case "db": s.db = value
+            case "connections": s.connections = Int(value)
             default: break
             }
         }
@@ -202,6 +204,8 @@ final class Controller: ObservableObject {
     @Published var busy: String?            // name of the action in progress, if any
     @Published var openAtLogin = SMAppService.mainApp.status == .enabled
     @Published var setupError: String?
+    /// Recent connection and start/stop events from `quackd activity`, newest first.
+    @Published var activity: [String] = []
     /// Databases served before, most recent first; shown in the Database submenu.
     @Published private(set) var recentDatabases: [String] =
         UserDefaults.standard.stringArray(forKey: "recentDatabases") ?? []
@@ -233,6 +237,10 @@ final class Controller: ObservableObject {
             status = s
             AppDelegate.logPath = s.log
             if !s.db.isEmpty { rememberDatabase(s.db) }
+            if s.configured {
+                let events = await Shell.quackd(["activity", "8"])
+                activity = events.output.split(separator: "\n").map(String.init).reversed()
+            }
             openAtLogin = SMAppService.mainApp.status == .enabled
             await repairServiceIfNeeded(s)
         }
@@ -312,18 +320,35 @@ final class Controller: ObservableObject {
     /// A running server drops its clients on restart, so confirm first.
     func switchDatabase(to path: String) {
         guard path != status.db else { return }
-        if status.loaded {
-            NSApp.activate(ignoringOtherApps: true)
-            let alert = NSAlert()
-            alert.messageText = "Serve \((path as NSString).lastPathComponent)?"
-            alert.informativeText = "The quack server will restart with this database. "
-                + "Clients connected to \((status.db as NSString).lastPathComponent) will be disconnected."
-            alert.addButton(withTitle: "Switch and Restart")
-            alert.addButton(withTitle: "Cancel")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
+        let name = (path as NSString).lastPathComponent
+        guard confirmDisconnect(title: "Serve \(name)?", button: "Switch and Restart") else { return }
         rememberDatabase(path)
         perform(["use", path])
+    }
+
+    func stopServer() {
+        guard confirmDisconnect(title: "Stop the quack server?", button: "Stop") else { return }
+        perform(["stop"])
+    }
+
+    func restartServer() {
+        guard confirmDisconnect(title: "Restart the quack server?", button: "Restart") else { return }
+        perform(["restart"])
+    }
+
+    /// Ask before an action that would drop connected clients. Returns true to go ahead;
+    /// no question when nobody is connected (or the count is unknown).
+    private func confirmDisconnect(title: String, button: String) -> Bool {
+        guard status.phase == .running, let n = status.connections, n > 0 else { return true }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = n == 1
+            ? "1 client is connected and will be disconnected."
+            : "\(n) clients are connected and will be disconnected."
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// Recent databases that still exist, for the menu.
@@ -435,6 +460,53 @@ final class Controller: ObservableObject {
         }
     }
 
+    /// "2 clients connected" while running, when the server has reported a count.
+    var connectionsLine: String? {
+        guard status.phase == .running, let n = status.connections else { return nil }
+        switch n {
+        case 0: return "No clients connected"
+        case 1: return "1 client connected"
+        default: return "\(n) clients connected"
+        }
+    }
+
+    /// Shorten a log line for the Recent Activity menu: drop today's date, keep the
+    /// time, and trim the longer messages.
+    func activityTitle(_ line: String) -> String {
+        let parts = line.split(separator: " ", maxSplits: 2).map(String.init)
+        guard parts.count == 3 else { return line }
+        let (date, time, message) = (parts[0], parts[1], parts[2])
+        let today = Self.dayFormatter.string(from: Date())
+        let when = date == today ? time : "\(date) \(time)"
+        return "\(when)  \(Self.shortMessage(message))"
+    }
+
+    private static let dayFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private static func shortMessage(_ m: String) -> String {
+        if m.hasPrefix("starting quack server: db="),
+           let db = m.dropFirst("starting quack server: db=".count).components(separatedBy: " listen=").first {
+            return "started (\((db as NSString).lastPathComponent))"
+        }
+        if m.hasPrefix("quack server stopped") { return "stopped" }
+        if m.hasPrefix("quack server exited unexpectedly") {
+            return "crashed" + (m.range(of: "(exit code").map { " " + m[$0.lowerBound...] } ?? "")
+        }
+        if m.hasPrefix("quackd: failure"), let semi = m.firstIndex(of: ";") {
+            return String(m[m.index(m.startIndex, offsetBy: 8)..<semi])   // "failure 2 of 5"
+        }
+        if m.hasPrefix("quackd: giving up") { return "gave up" }
+        if m.hasPrefix("disconnected ("), let client = m.range(of: "client ") {
+            return "disconnected (client \(m[client.upperBound...])"
+        }
+        return m
+    }
+
     /// Extra explanation shown under the status line, if any.
     var detailLine: String? {
         switch status.phase {
@@ -461,8 +533,12 @@ struct MenuContent: View {
         if let detail = controller.detailLine {
             Text(detail).lineLimit(3)
         }
+        if let connections = controller.connectionsLine {
+            Text(connections)
+        }
         if controller.status.configured {
             databaseMenu(idle: idle)
+            activityMenu
         }
         Divider()
 
@@ -476,9 +552,9 @@ struct MenuContent: View {
         default:
             Button("Start") { controller.perform(["start"]) }
                 .disabled(!idle || phase == .running || phase == .starting || phase == .unknown)
-            Button("Stop") { controller.perform(["stop"]) }
+            Button("Stop") { controller.stopServer() }
                 .disabled(!idle || phase == .stopped || phase == .gaveUp || phase == .unknown)
-            Button("Restart") { controller.perform(["restart"]) }
+            Button("Restart") { controller.restartServer() }
                 .disabled(!idle || phase == .unknown)
         }
         Divider()
@@ -498,6 +574,21 @@ struct MenuContent: View {
         Button("Quackd \(controller.appVersion) on GitHub…") { controller.openProjectPage() }
         Button("Quit Quackd Menu") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+
+    /// "Recent Activity ▸": the last few connections, rejections, starts, and stops.
+    private var activityMenu: some View {
+        Menu("Recent Activity") {
+            if controller.activity.isEmpty {
+                Text("No activity yet")
+            } else {
+                ForEach(Array(controller.activity.enumerated()), id: \.offset) { _, line in
+                    Text(controller.activityTitle(line))
+                }
+            }
+            Divider()
+            Button("Open Log") { controller.openLog() }
+        }
     }
 
     /// "Database: x.duckdb ▸" with recent databases (current one checked) and a file picker.
