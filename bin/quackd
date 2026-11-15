@@ -19,7 +19,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.6.2"
+QUACKD_VERSION="1.6.3"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and
@@ -212,7 +212,10 @@ cmd_run() {
   # can use spatial functions. INSTALL downloads it the first time (needs network) and is
   # a no-op once it's cached in ~/.duckdb/extensions. Under .bail on, a failed install or
   # load stops startup like any other error, and launchd retries.
-  local extensions="INSTALL spatial; LOAD spatial;"
+  # geometry_always_xy makes spatial treat coordinates as x/y (longitude, latitude)
+  # order whatever the coordinate system says. It's set GLOBAL so it applies to every
+  # client connection, not just this CLI session.
+  local extensions="INSTALL spatial; LOAD spatial; SET GLOBAL geometry_always_xy = true;"
   printf '.bail on\n.output /dev/null\n%s\n%s\n%s\n.output\n.bail off\n' "$logging" "$extensions" "$serve" >&3
 
   # Once serving, log one line naming every loaded extension and its version, e.g.

@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.6.3] - 2026-11-15
+
+### quackd (CLI)
+- After loading `spatial`, the server runs `SET GLOBAL geometry_always_xy = true`, so spatial functions always treat coordinates as x/y (longitude, latitude) order, for every client connection.
+
 ## [1.6.2] - 2026-11-15
 
 ### quackd (CLI)
