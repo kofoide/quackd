@@ -168,6 +168,8 @@ EOF
   check "rotated log starts fresh" bash -c "head -1 '$LOG' | grep -q 'log rotated at 1 MB' && (( \$(stat -f %z '$LOG') < 10000 ))"
 
   perl -e 'select(undef, undef, undef, 2.5)'   # first connection snapshot
+  check "log lists the loaded extensions, including quack and spatial" \
+    grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} extensions loaded: .*quack.*spatial' "$LOG"
   check "clients reports no connections at first" bash -c "/bin/bash '$QUACKD' clients | grep -q 'No clients connected'"
 
   answer="$("$DUCKDB" -no-agent -noheader -list -c \

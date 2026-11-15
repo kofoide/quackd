@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.6.2] - 2026-11-15
+
+### quackd (CLI)
+- The server loads DuckDB's `spatial` extension before it starts serving, so queries on the server can use spatial functions. The first start downloads the extension, which needs network access. After that it uses the cached copy. If the extension can't be installed or loaded, the start fails and is retried like any other startup error.
+- Once the server is up, the log gets one line listing every loaded extension and its version, for example `extensions loaded: core_functions v2.0.0, …, quack …, spatial …`. The line is logged whatever `QUACK_LOG` is set to.
+- Every function in `bin/quackd` now has a comment explaining what it does.
+
 ## [1.6.1] - 2026-11-09
 
 No changes to the CLI or the app.

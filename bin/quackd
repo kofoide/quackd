@@ -19,7 +19,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.6.1"
+QUACKD_VERSION="1.6.2"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and
@@ -43,13 +43,18 @@ DOMAIN="gui/$(id -u)"
 
 RUN_MODE=""   # set by `run`, so errors go to the log with a timestamp
 
+# Current local time as "YYYY-MM-DD HH:MM:SS", the timestamp format used in the log.
 ts() { date '+%F %T'; }
 
+# Print an error to stderr and exit 1. Under `run` the message gets a timestamp, since
+# it goes to the log; otherwise it's prefixed "quackd:" for the terminal.
 die() {
   if [[ -n "$RUN_MODE" ]]; then echo "$(ts) quackd: $*" >&2; else echo "quackd: $*" >&2; fi
   exit 1
 }
 
+# Source CONFIG_FILE and validate it: QUACK_DB and QUACK_TOKEN (4+ characters) must be
+# set and duckdb must be found. Defaults QUACK_LISTEN and sets DUCKDB_BIN. Dies on error.
 load_config() {
   [[ -f "$CONFIG_FILE" ]] || die "no config at $CONFIG_FILE (run: quackd init <database.duckdb>)"
   # shellcheck source=/dev/null
@@ -92,6 +97,9 @@ check_db() {
   printf '%s\n' "$(cd "$(dirname "$db")" && pwd)/$(basename "$db")"
 }
 
+# `quackd init <db>`: write a new config (mode 600) serving <db>, with a random
+# 48-character hex token and the optional settings listed as comments. Never
+# overwrites an existing config.
 cmd_init() {
   if [[ -f "$CONFIG_FILE" ]]; then echo "Config already exists: $CONFIG_FILE"; return; fi
   local db="${1:-}"
@@ -152,6 +160,10 @@ cmd_use() {
   if is_loaded; then cmd_restart; fi
 }
 
+# `quackd run`: what launchd invokes. Starts duckdb with quack_serve() in the
+# foreground, keeps it fed through a FIFO so it never exits, writes the client snapshot
+# and rotates the log every TICK seconds, and passes stop signals on to duckdb. Exits 0
+# on a requested stop, non-zero on a crash (see on_run_exit).
 cmd_run() {
   RUN_MODE=1
   RUN_STARTED=$(date +%s)
@@ -196,7 +208,23 @@ cmd_run() {
   esac
   # After startup, .bail off: the periodic snapshot below must never stop the server
   # just because one of its statements failed.
-  printf '.bail on\n.output /dev/null\n%s\n%s\n.output\n.bail off\n' "$logging" "$serve" >&3
+  # The spatial extension is loaded right before quack_serve() so queries on the server
+  # can use spatial functions. INSTALL downloads it the first time (needs network) and is
+  # a no-op once it's cached in ~/.duckdb/extensions. Under .bail on, a failed install or
+  # load stops startup like any other error, and launchd retries.
+  local extensions="INSTALL spatial; LOAD spatial;"
+  printf '.bail on\n.output /dev/null\n%s\n%s\n%s\n.output\n.bail off\n' "$logging" "$extensions" "$serve" >&3
+
+  # Once serving, log one line naming every loaded extension and its version, e.g.
+  #   2026-11-15 07:09:12 extensions loaded: core_functions v2.0.0, …, quack v…, spatial …
+  # DuckDB writes the whole line (timestamp included) to stdout, which is the log; in
+  # 'connections' mode format_connection_log passes it through. It runs after .bail off,
+  # so if it fails the server keeps serving. COPY prints nothing, so .mode list doesn't
+  # change what the snapshots below write to the log.
+  local report="SELECT strftime(current_localtimestamp(), '%Y-%m-%d %H:%M:%S') || ' extensions loaded: '"
+  report+=" || string_agg(extension_name || coalesce(' ' || nullif(extension_version, ''), ''), ', ' ORDER BY extension_name)"
+  report+=" FROM duckdb_extensions() WHERE loaded;"
+  printf '.mode list\n.headers off\n%s\n' "$report" >&3
 
   # duckdb runs as a child (not exec'd) so this script can log when it stops. In
   # 'connections' mode its stdout goes through the filter via a second FIFO, so we
@@ -298,9 +326,6 @@ on_run_exit() {
   exit "$rc"
 }
 
-# macOS notification (QUACK_NOTIFY=false disables). Tries, in order: Quackd.app,
-# terminal-notifier (clicking opens the log), then the built-in osascript banner.
-# Never fails the caller: a missing or blocked notification just gets skipped.
 # If the log has reached QUACK_LOG_MAX_MB, rotate it: quackd.log.1 → .2 and so on
 # (keeping QUACK_LOG_KEEP), copy the log to quackd.log.1, then empty it in place.
 # Copy-and-truncate rather than rename, because launchd and duckdb hold the log open:
@@ -322,6 +347,9 @@ rotate_log_if_needed() {
   echo "$(ts) quackd: log rotated at ${max} MB$( (( keep > 0 )) && echo "; previous log: $LOG_FILE.1")"
 }
 
+# macOS notification (QUACK_NOTIFY=false disables). Tries, in order: Quackd.app,
+# terminal-notifier (clicking opens the log), then the built-in osascript banner.
+# Never fails the caller: a missing or blocked notification just gets skipped.
 notify() {
   [[ "${QUACK_NOTIFY:-true}" == "true" ]] || return 0
   local title="$1" message="$2"
@@ -348,10 +376,12 @@ APPLESCRIPT
 urlencode() { printf '%s' "$1" | perl -pe 's/([^A-Za-z0-9._~-])/sprintf("%%%02X", ord($1))/ge'; }
 
 # Turn DuckDB 'Quack' log rows (tab-separated; field 8 = log type, field 10 = message)
-# into one line per connect/disconnect. Everything else (queries, multi-line SQL) is dropped.
+# into one line per connect/disconnect. The "extensions loaded" line cmd_run asks for at
+# startup passes through as is. Everything else (queries, multi-line SQL) is dropped.
 format_connection_log() {
   perl -ne '
     BEGIN { $| = 1 }
+    if (/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d extensions loaded: /) { print; next }
     my @f = split /\t/, $_, 10;
     next unless @f == 10 && $f[7] eq "Quack";
     my $m = $f[9];
@@ -377,6 +407,9 @@ format_connection_log() {
 # Escape text for inclusion in plist XML.
 xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
+# Write the launchd agent plist to PLIST. It runs this script with `run`, passes the
+# QUACKD_* locations through so the service matches this shell, restarts only after a
+# non-zero exit (at most every 10s), and sends stdout and stderr to LOG_FILE.
 write_plist() {
   mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
   cat >"$PLIST" <<EOF
@@ -412,8 +445,12 @@ write_plist() {
 EOF
 }
 
+# True if launchd has the job loaded: started and not stopped, whether it's running,
+# waiting to retry, or has given up.
 is_loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
 
+# `quackd install`: check the config, write the plist, and remove any plist left in
+# ~/Library/LaunchAgents by older versions. Does not start the server.
 cmd_install() {
   load_config
   write_plist
@@ -422,12 +459,16 @@ cmd_install() {
   if is_loaded; then echo "Note: $LABEL is already running; run 'quackd restart' to apply plist changes."; fi
 }
 
+# `quackd uninstall`: stop the job if it's loaded and delete the plist (current and
+# legacy locations). The config, logs, and database are left alone.
 cmd_uninstall() {
   is_loaded && launchctl bootout "$DOMAIN/$LABEL" || true
   rm -f "$PLIST" "$LEGACY_PLIST"
   echo "Removed $LABEL"
 }
 
+# `quackd start`: clear the failure count and load the job (or kick it if already
+# loaded, e.g. after it gave up). launchd then keeps it running until `stop`.
 cmd_start() {
   [[ -f "$PLIST" ]] || die "not installed (run: quackd install)"
   rm -f "$FAIL_FILE"
@@ -435,11 +476,15 @@ cmd_start() {
   echo "Started"
 }
 
+# `quackd stop`: unload the job, which sends the server SIGTERM and keeps launchd from
+# restarting it. Succeeds even if it wasn't running.
 cmd_stop() {
   is_loaded && launchctl bootout "$DOMAIN/$LABEL" || true
   echo "Stopped"
 }
 
+# `quackd restart`: clear the failure count, unload the job, and load it again,
+# retrying for up to 5s while launchd finishes the unload.
 cmd_restart() {
   [[ -f "$PLIST" ]] || die "not installed (run: quackd install)"
   rm -f "$FAIL_FILE"
@@ -557,6 +602,8 @@ connection_count() {
   if [[ -z "$list" ]]; then echo 0; else printf '%s\n' "$list" | wc -l | tr -d ' '; fi
 }
 
+# `quackd clients`: print the open connections from the latest snapshot as a table
+# (connection id, client hash, state, last query start time).
 cmd_clients() {
   local list n
   list="$(fresh_clients)" || { echo "The quack server isn't running."; return 0; }
@@ -580,6 +627,9 @@ cmd_activity() {
     | tail -n "$n" || true
 }
 
+# `quackd status [--porcelain]`: show launchd's view of the job (state, pid, runs, last
+# exit), any failure streak, the database, whether the port accepts connections, and
+# the connection count. --porcelain prints status_porcelain instead.
 cmd_status() {
   if [[ "${1:-}" == "--porcelain" ]]; then status_porcelain; return; fi
   local info="" running=""
@@ -609,6 +659,8 @@ cmd_status() {
   fi
 }
 
+# `quackd logs`: show the last 50 log lines and follow the log (by name, so it keeps
+# going across rotations). Creates the log if it doesn't exist yet.
 cmd_logs() { mkdir -p "$LOG_DIR"; touch "$LOG_FILE"; tail -n 50 -F "$LOG_FILE"; }
 
 case "${1:-}" in

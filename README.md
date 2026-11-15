@@ -19,7 +19,7 @@ quackd turns that into a proper macOS service:
 ## Requirements
 
 - macOS 13 (Ventura) or later, on Apple Silicon or Intel.
-- **DuckDB with the `quack` extension**, which you install yourself, for example with `brew install duckdb`. quackd uses whichever `duckdb` it finds: the one on your `PATH`, then `/opt/homebrew/bin`, then `/usr/local/bin`, or set `DUCKDB_BIN` in the config. It's tested with DuckDB v2.0.0.
+- **DuckDB with the `quack` extension**, which you install yourself, for example with `brew install duckdb`. quackd uses whichever `duckdb` it finds: the one on your `PATH`, then `/opt/homebrew/bin`, then `/usr/local/bin`, or set `DUCKDB_BIN` in the config. It's tested with DuckDB v2.0.0. The server also loads the `spatial` extension, which DuckDB downloads the first time the server starts, so that start needs network access.
 - **To build from source:** the Xcode Command Line Tools (`xcode-select --install`). Full Xcode isn't needed.
 
 ## Install
@@ -141,6 +141,7 @@ The log is at `~/Library/Logs/quackd/quackd.log`. Run `quackd logs` to follow it
 
 ```
 2026-11-07 11:21:24 starting quack server: db=/Users/me/data/my.duckdb listen=quack:localhost
+2026-11-07 11:21:24 extensions loaded: core_functions v2.0.0, icu v2.0.0, json v2.0.0, parquet v2.0.0, quack …, spatial …
 2026-11-07 11:21:24 connection accepted
 2026-11-07 11:21:24 disconnected (connection 82A19F81, client 04771310)
 2026-11-07 11:21:30 connection REJECTED: Invalid Input Error: Authentication failed
