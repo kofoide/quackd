@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.6.4] - 2026-11-16
+
+### quackd (CLI)
+- Stopping the server (`quackd stop`, `restart`, `uninstall`, or any SIGTERM/SIGINT/SIGHUP) now runs `CHECKPOINT` and quits DuckDB cleanly, instead of killing it. The WAL is flushed into the database file, so the next open doesn't have to replay it and the `.wal` file is gone. If the server hasn't stopped within 15 seconds, it falls back to SIGTERM. The log shows `received SIGTERM: checkpointing database before stopping` before the usual `quack server stopped` line.
+
 ## [1.6.3] - 2026-11-15
 
 ### quackd (CLI)

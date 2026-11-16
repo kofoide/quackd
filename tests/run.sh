@@ -194,8 +194,16 @@ EOF
   if grep -q "$TOKEN" "$LOG"; then fail "token never appears in the log"; else pass "token never appears in the log"; fi
   if pgrep -f -- "$TOKEN" >/dev/null; then fail "token never appears in ps"; else pass "token never appears in ps"; fi
 
+  # A write through the server lands in the WAL; stopping should checkpoint it away.
+  "$DUCKDB" -no-agent -c "LOAD quack; ATTACH 'quack:localhost:$PORT' AS r (TOKEN '$TOKEN'); CREATE TABLE r.w AS SELECT 7 AS v;" >/dev/null 2>&1
+  check "a client write leaves a WAL while serving" test -s "$REAL_DB.wal"
+
   kill -TERM "$SERVER_PID"; wait "$SERVER_PID"; rc=$?; SERVER_PID=""
   check "SIGTERM stops the server with exit 0" test "$rc" = "0"
+  check "log records the shutdown checkpoint" grep -q "received SIGTERM: checkpointing database before stopping" "$LOG"
+  check "stop checkpoints the WAL into the database" test ! -s "$REAL_DB.wal"
+  check "checkpointed write survives the stop" \
+    test "$("$DUCKDB" -no-agent -noheader -list "$REAL_DB" -c "SELECT v FROM w" 2>&1)" = "7"
   check "log records the clean stop" grep -q "quack server stopped (received SIGTERM)" "$LOG"
   check "clean stop leaves no failure count" test ! -e "$QUACKD_STATE_DIR/$QUACKD_LABEL.failures"
   check "clean stop removes the clients snapshot" test ! -e "$QUACKD_STATE_DIR/$QUACKD_LABEL.clients"

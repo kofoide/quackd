@@ -19,7 +19,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.6.3"
+QUACKD_VERSION="1.6.4"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and
@@ -38,6 +38,7 @@ FAIL_FILE="$STATE_DIR/$LABEL.failures"
 CLIENTS_FILE="$STATE_DIR/$LABEL.clients"
 TICK=2
 STABLE_SECONDS=60   # a run that lasted this long resets the consecutive-failure count
+STOP_TIMEOUT=15     # seconds to wait for the shutdown checkpoint before sending SIGTERM
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DOMAIN="gui/$(id -u)"
 
@@ -256,11 +257,28 @@ cmd_run() {
   snapshot+=" strftime(timezone('UTC', query_started_at), '%Y-%m-%d %H:%M:%S') FROM quack_active_connections()"
   snapshot+=" ORDER BY query_started_at) TO $(sql_quote "$CLIENTS_FILE") (FORMAT csv, HEADER false);"
 
-  # launchd stops the job with SIGTERM: pass it on to duckdb and remember why.
-  local signal=""
-  trap 'signal=TERM; kill -TERM "$child" 2>/dev/null' TERM
-  trap 'signal=INT;  kill -TERM "$child" 2>/dev/null' INT
-  trap 'signal=HUP;  kill -TERM "$child" 2>/dev/null' HUP
+  # launchd stops the job with SIGTERM. Rather than killing duckdb, ask it to
+  # CHECKPOINT (flush the WAL into the database file) and then .quit, so it closes the
+  # database cleanly. duckdb reads stdin in order, so this runs after anything already
+  # queued. If it hasn't exited after STOP_TIMEOUT seconds (e.g. a long client query is
+  # holding things up), or a second signal arrives, fall back to SIGTERM. STOP_TIMEOUT
+  # stays under launchd's 20s ExitTimeOut, after which launchd sends SIGKILL.
+  local signal="" watchdog=""
+  # shellcheck disable=SC2329  # invoked from the traps below
+  stop_server() {
+    if [[ -n "$signal" ]]; then kill -TERM "$child" 2>/dev/null || true; return 0; fi
+    signal=$1
+    echo "$(ts) received SIG$1: checkpointing database before stopping"
+    printf '.output /dev/null\nCHECKPOINT;\n.quit\n' >&3 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
+    ( sleep "$STOP_TIMEOUT"
+      kill -0 "$child" 2>/dev/null || exit 0
+      echo "$(ts) quackd: server didn't stop within ${STOP_TIMEOUT}s; sending SIGTERM"
+      kill -TERM "$child" 2>/dev/null ) &
+    watchdog=$!
+  }
+  trap 'stop_server TERM' TERM
+  trap 'stop_server INT' INT
+  trap 'stop_server HUP' HUP
 
   # Until duckdb exits: take a snapshot and check the log size every TICK seconds.
   # The sleep runs in the background because `wait` (unlike a foreground command)
@@ -281,6 +299,7 @@ cmd_run() {
   done
   # bash keeps the exit status of a finished background job until it's waited for.
   wait "$child" 2>/dev/null && rc=0 || rc=$?
+  [[ -n "$watchdog" ]] && { pkill -P "$watchdog" 2>/dev/null; kill "$watchdog" 2>/dev/null; } || true
   exec 3>&-
   [[ -n "$filter_pid" ]] && wait "$filter_pid" 2>/dev/null
 
