@@ -68,7 +68,7 @@ check "init refuses to overwrite an existing config" bash -c '/bin/bash "$QUACKD
 porcelain="$(q status --porcelain)"
 missing=""
 for key in version installed loaded state pid runs last_exit failures max_failures listening \
-           host port log config configured config_error duckdb service_script; do
+           responding host port log config configured config_error duckdb service_script; do
   grep -q "^$key=" <<<"$porcelain" || missing+=" $key"
 done
 if [[ -z "$missing" ]]; then pass "status --porcelain has every documented key"; else fail "status --porcelain has every documented key" "missing:$missing"; fi
@@ -170,6 +170,12 @@ EOF
   perl -e 'select(undef, undef, undef, 2.5)'   # first connection snapshot
   check "log lists the loaded extensions, including quack and spatial" \
     grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} extensions loaded: .*quack.*spatial' "$LOG"
+  porcelain="$(q status --porcelain)"
+  if grep -qx "listening=yes" <<<"$porcelain" && grep -qx "responding=yes" <<<"$porcelain"; then
+    pass "status --porcelain reports a working server as listening and responding"
+  else
+    fail "status --porcelain reports a working server as listening and responding" "$porcelain"
+  fi
   check "clients reports no connections at first" bash -c "/bin/bash '$QUACKD' clients | grep -q 'No clients connected'"
 
   answer="$("$DUCKDB" -no-agent -noheader -list -c \
@@ -220,6 +226,42 @@ EOF
   check "activity N limits the output" test "$(q activity 2 | wc -l | tr -d ' ')" = "2"
   out="$(q activity abc 2>&1)"; rc=$?
   if (( rc != 0 )) && contains "$out" "usage: quackd activity"; then pass "activity rejects a non-number"; else fail "activity rejects a non-number" "$out"; fi
+
+  # A server that's alive but stuck: freeze duckdb so the port still accepts TCP but
+  # nothing answers. Status should say so, and the service should give up on it and
+  # exit non-zero (launchd would then start a fresh one). A stopped process can't
+  # checkpoint, so this also exercises the SIGTERM fallback.
+  QUACKD_HEALTH_EVERY=2 QUACKD_HEALTH_FAILURES=2 QUACKD_STOP_TIMEOUT=2 /bin/bash "$QUACKD" run >>"$LOG" 2>&1 &
+  SERVER_PID=$!
+  up=""
+  for _ in $(seq 1 100); do
+    nc -z localhost "$PORT" 2>/dev/null && { up=1; break; }
+    perl -e 'select(undef, undef, undef, 0.1)'
+  done
+  perl -e 'select(undef, undef, undef, 3)'   # let a health check see it answer first
+  duck="$(pgrep -P "$SERVER_PID" -x duckdb)"
+  if [[ -n "$up" && -n "$duck" ]]; then
+    kill -STOP "$duck"
+    porcelain="$(q status --porcelain)"
+    if grep -qx "listening=yes" <<<"$porcelain" && grep -qx "responding=no" <<<"$porcelain"; then
+      pass "status --porcelain reports a stuck server as listening but not responding"
+    else
+      fail "status --porcelain reports a stuck server as listening but not responding" "$porcelain"
+    fi
+    out="$(q status)"
+    if contains "$out" "listening: not responding"; then pass "status says a stuck server isn't responding"; else fail "status says a stuck server isn't responding" "$out"; fi
+    wait "$SERVER_PID"; rc=$?; SERVER_PID=""
+    check "a stuck server makes the service exit non-zero" test "$rc" != "0"
+    check "log records the missed health checks" grep -q "server didn't answer on localhost:$PORT (check 2 of 2)" "$LOG"
+    check "log records the unresponsive restart" grep -q "quack server stopped responding; restarting it" "$LOG"
+    check "a server that doesn't stop in time gets SIGTERM" grep -q "server didn't stop within 2s; sending SIGTERM" "$LOG"
+    check "log records why the server exited" grep -q "quack server exited after it stopped responding" "$LOG"
+    check "the unresponsive restart counts a failure" grep -qx 1 "$QUACKD_STATE_DIR/$QUACKD_LABEL.failures"
+  else
+    fail "second server starts for the stuck-server test" "$(tail -c 2000 "$LOG")"
+  fi
+  if grep -q "Terminated" "$LOG"; then fail "stopping leaves no shell job notices in the log" "$(grep Terminated "$LOG")"; else pass "stopping leaves no shell job notices in the log"; fi
+  rm -f "$QUACKD_STATE_DIR/$QUACKD_LABEL.failures"
 
   # A failed start (missing database) counts a failure and exits non-zero.
   sed -i '' "s|^QUACK_DB=.*|QUACK_DB=$(printf '%q' "$TMP/gone.duckdb" | sed 's/[|&]/\\&/g')|" "$QUACKD_CONFIG_DIR/config"

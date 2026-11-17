@@ -172,7 +172,7 @@ Clears the failure count, then:
 - if it's loaded but not running (for example, after it gave up), starts it with `launchctl kickstart`
 
 ### `cmd_stop` (`quackd stop`)
-Unloads the job with `launchctl bootout`. launchd sends `run` a SIGTERM, and `run` shuts DuckDB down and logs `quack server stopped`. Unloading, rather than just stopping, makes sure launchd won't bring it back.
+Unloads the job with `launchctl bootout`. launchd sends `run` a SIGTERM, and `run` checkpoints and closes the database, then logs `quack server stopped`. Unloading, rather than just stopping, makes sure launchd won't bring it back.
 
 ### `cmd_restart` (`quackd restart`)
 Clears the failure count, unloads the job, and loads it again. A full reload is used, rather than `kickstart -k`, so that a plist rewritten by `install` takes effect. `bootstrap` can fail briefly while launchd is still cleaning up after the unload, so it retries up to 10 times, half a second apart.
@@ -181,7 +181,10 @@ Clears the failure count, unloads the job, and loads it again. A full reload is 
 Shows:
 - launchd's view of the job: `state`, `pid`, `runs` (how many times launchd has started it), and `last exit code`
 - `consecutive failures: N`, but only when the server isn't running. The count isn't cleared while a healthy run is in progress, so showing it then would be misleading.
-- `listening: yes/no`, from trying to connect to the host and port in `QUACK_LISTEN` with `nc`. The default port is 9494.
+- `listening:` for the host and port in `QUACK_LISTEN` (default port 9494):
+  - `yes` if the server answers a plain HTTP `GET /` (`server_responds`). The Quack server replies with a short banner. The request needs no token and isn't logged as a connection.
+  - `not responding` if the port accepts TCP (`port_open`, using `nc`) but the server doesn't answer within 2 seconds. That means the server process is alive but stuck. Checking the port alone can't catch this: macOS completes TCP handshakes from the listen backlog even when the process never accepts them.
+  - `no` if nothing accepts connections on the port.
 
 It loads the config in a subshell first, so a missing or broken config just skips the "listening" line instead of quitting `status` with an error.
 
@@ -190,7 +193,7 @@ The same information in a form that's easy for programs to read: one `key=value`
 - **Version:** `version`.
 - **launchd:** `installed`, `loaded`, `state`, `pid`, `runs`, `last_exit`.
 - **Failures:** `failures`, `max_failures`.
-- **Server:** `listening`, `host`, `port`.
+- **Server:** `listening` (the port accepts TCP), `responding` (the server answers `GET /`), `host`, `port`. `listening=yes` with `responding=no` means the server is stuck.
 - **Files:** `log` and `config` (paths).
 - **Setup checks:**
   - `configured`: `yes` if `load_config` succeeds.
@@ -253,14 +256,16 @@ The service itself. launchd runs this, and you can also run it in a terminal to 
    - In `all` or `off` mode, DuckDB's output goes straight to the log.
 
    The script keeps its own copy of descriptor 3 open, so it can send DuckDB more commands later.
-8. **Pass shutdown signals on.** On TERM, INT, or HUP, it records which signal arrived and sends SIGTERM to DuckDB.
+8. **Handle shutdown signals.** On TERM, INT, or HUP, it records which signal arrived and calls `stop_server`, which logs `received SIGTERM: checkpointing database before stopping` and sends `CHECKPOINT;` and `.quit` through descriptor 3. DuckDB flushes the WAL into the database file and closes it cleanly. A background watchdog sends SIGTERM if DuckDB is still running after `STOP_TIMEOUT` (15) seconds, and SIGKILL 5 seconds after that. 15 seconds stays under launchd's 20-second limit, after which launchd sends SIGKILL itself. A second signal sends SIGTERM right away. The watchdog's stderr goes to `/dev/null`, so bash's "Terminated" notice for its `sleep` stays out of the log.
 9. **Tick until DuckDB exits.** Every `TICK` (2) seconds it:
    - writes a `COPY (… FROM quack_active_connections()) TO '<CLIENTS_FILE>'` statement into descriptor 3. The server writes its own connection list, which is cheaper than connecting as a client, and doesn't add a connection to the log every two seconds. The times are converted from UTC to local time, to match the log.
    - calls `rotate_log_if_needed`.
+   - every `HEALTH_EVERY` (30) seconds, checks that the server answers with `server_responds`. A server can stay alive but stop answering (this was seen after the Mac sleeps), and launchd can't tell. Each miss is logged as `server didn't answer on host:port (check N of 3)`. After `HEALTH_FAILURES` (3) misses in a row, it logs `quack server stopped responding; restarting it` and stops DuckDB with `stop_server`. Misses only count once the server has answered at least once, so a slow start, such as the first `INSTALL spatial` on a slow network, is never mistaken for a stuck server. Time asleep doesn't count either, because the checks are paused too. `QUACKD_HEALTH_EVERY`, `QUACKD_HEALTH_FAILURES` (0 turns the restart off), and `QUACKD_STOP_TIMEOUT` override these values. The tests use them.
 
    **The sleep runs in the background, and the script `wait`s for it.** A trapped signal interrupts `wait` right away, but not a foreground `sleep`, so a stop is never delayed. After a signal it stops ticking and just waits for DuckDB to shut down. A crash is noticed within one tick. bash remembers a finished child's exit code, so the final `wait` still gets it. Then it waits for the log filter, so the filter's last lines are written before the final message.
 10. **Log how it ended:**
     - It was stopped by a signal: logs `quack server stopped (received SIGTERM)` and exits 0.
+    - It stopped a stuck server: logs `quack server exited after it stopped responding` and exits 1, so launchd starts a fresh one. It sets `EXIT_REASON`, so the notification says it stopped responding instead of giving an exit code.
     - DuckDB exited on its own: logs `quack server exited unexpectedly (exit code N)` and exits with that code. If DuckDB somehow exited with 0, it exits 1, so an unexpected exit is never treated as a clean stop.
 
 ### `on_run_exit <exit code>`
@@ -296,7 +301,7 @@ An invalid `QUACK_MAX_FAILURES` falls back to 5, and `0` means retry forever.
 
 - **`ServiceStatus`** holds one snapshot of `status --porcelain`, and `parse` reads it. The computed `phase` is checked in this order:
   1. the status command failed → `unknown`
-  2. launchd says running → `running` if the port answers, `starting` if not
+  2. launchd says running → `running` if the server answers, `notResponding` if the port is open but the server doesn't answer, `starting` if the port isn't open yet
   3. no DuckDB found → `noDuckDB`
   4. config missing or invalid → `notConfigured`
   5. no plist → `notInstalled`
@@ -373,7 +378,11 @@ Everything runs against a temporary folder and the label `net.kofoid.quackd-test
   - a client with a wrong token is rejected
   - both connections are logged
   - the token appears in neither the log nor `ps`
+  - porcelain reports the running server as `listening=yes` and `responding=yes`
+  - a write through a client leaves a WAL, and SIGTERM checkpoints it away while keeping the data
   - SIGTERM exits 0 and logs the stop
+  - a server frozen with SIGSTOP shows as `listening=yes`, `responding=no`, and `not responding`, and the service logs the missed checks, falls back to SIGTERM, and exits non-zero with a failure counted
+  - stopping leaves no "Terminated" notices in the log
   - a missing database counts failure 1, and the 5th failure gives up with exit 0
 
 ### CI and releases
@@ -405,5 +414,6 @@ The `case` statement at the bottom calls the `cmd_*` function for the command yo
 |---|---|---|
 | `quackd stop` / `restart` / `uninstall` (SIGTERM) | 0 | Job unloaded, nothing restarts. |
 | DuckDB crashes or can't start, below the failure limit | DuckDB's code (or 1) | Restarts in about 10 seconds. |
+| Server stopped answering (3 missed health checks), below the limit | 1 | Restarts in about 10 seconds. |
 | Config or database error before DuckDB starts, below the limit | 1 | Restarts in about 10 seconds. |
 | Failure limit reached | 0 | Stays loaded but stopped; `quackd start` brings it back. |

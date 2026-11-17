@@ -12,7 +12,7 @@ quackd turns that into a proper macOS service:
 
 - **Runs in the background** under launchd, with no terminal window.
 - **Starts only when you ask.** It never auto-starts at login or after a reboot.
-- **Recovers from crashes**, and gives up with a notification if something is persistently wrong, such as a missing database or another process holding the lock.
+- **Recovers from crashes**, and from a server that's still running but has stopped answering (which can happen after your Mac sleeps). It gives up with a notification if something is persistently wrong, such as a missing database or another process holding the lock.
 - **Logs every connection**, accepted or rejected, without ever writing your token to the log or exposing it in `ps`.
 - **Comes with a menu bar app**, so you can see at a glance whether the server is up, start or stop it, and copy a ready-to-paste connect command.
 
@@ -158,6 +158,17 @@ IO Error: Could not set lock on file "…": Conflicting lock is held in … (PID
 …
 2026-11-07 11:33:27 quackd: giving up after 5 consecutive failures. Fix the problem above, then run: quackd start
 ```
+
+A server can also stay running but stop answering, which has been seen after the Mac sleeps. quackd checks every 30 seconds that the server answers. After 3 missed checks in a row, it restarts the server, which counts as a failure:
+
+```
+2026-11-17 09:02:10 quackd: server didn't answer on localhost:9494 (check 3 of 3)
+2026-11-17 09:02:10 quack server stopped responding; restarting it
+2026-11-17 09:02:11 quack server exited after it stopped responding
+2026-11-17 09:02:11 quackd: failure 1 of 5; launchd will retry in about 10 seconds
+```
+
+`quackd status` shows a stuck server as `listening: not responding`, and the menu bar shows "Not responding".
 
 After `QUACK_MAX_FAILURES` failures in a row, it stops retrying until you run `quackd start` or click Start. A run that stays up for at least 60 seconds starts a fresh count.
 

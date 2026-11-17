@@ -26,7 +26,8 @@ struct ServiceStatus: Equatable {
     var pid = ""
     var failures = 0
     var maxFailures = 5
-    var listening = false
+    var listening = false   // the port accepts TCP connections
+    var responding: Bool?   // the server actually answers; nil from a script too old to say
     var host = "localhost"
     var port = "9494"
     var log = ""
@@ -41,12 +42,17 @@ struct ServiceStatus: Equatable {
 
     enum Phase {
         case unknown, noDuckDB, notConfigured, notInstalled
-        case stopped, starting, running, retrying, gaveUp
+        case stopped, starting, running, notResponding, retrying, gaveUp
     }
 
     var phase: Phase {
         if error != nil { return .unknown }
-        if loaded && state == "running" { return listening ? .running : .starting }
+        if loaded && state == "running" {
+            // An open port that doesn't answer means the server is stuck (seen after
+            // the Mac sleeps); the service restarts it after a few missed checks.
+            if !listening { return .starting }
+            return responding ?? true ? .running : .notResponding
+        }
         if duckdb.isEmpty { return .noDuckDB }
         if !configured { return .notConfigured }
         if !installed { return .notInstalled }
@@ -70,6 +76,7 @@ struct ServiceStatus: Equatable {
             case "failures": s.failures = Int(value) ?? 0
             case "max_failures": s.maxFailures = Int(value) ?? 5
             case "listening": s.listening = value == "yes"
+            case "responding": s.responding = value == "yes"
             case "host": s.host = value
             case "port": s.port = value
             case "log": s.log = value
@@ -439,7 +446,7 @@ final class Controller: ObservableObject {
         switch status.phase {
         case .running: return "bird.fill"
         case .starting, .retrying: return "arrow.triangle.2.circlepath"
-        case .gaveUp, .unknown, .noDuckDB: return "exclamationmark.triangle.fill"
+        case .notResponding, .gaveUp, .unknown, .noDuckDB: return "exclamationmark.triangle.fill"
         case .stopped, .notInstalled, .notConfigured: return "bird"
         }
     }
@@ -450,6 +457,7 @@ final class Controller: ObservableObject {
         switch s.phase {
         case .running: return "Running on \(s.host):\(s.port)"
         case .starting: return "Starting…"
+        case .notResponding: return "Not responding on \(s.host):\(s.port)"
         case .retrying: return "Failed \(s.failures) of \(s.maxFailures) — retrying"
         case .gaveUp: return "Gave up after \(s.failures) failures — check the log"
         case .stopped: return "Stopped"
@@ -493,7 +501,9 @@ final class Controller: ObservableObject {
            let db = m.dropFirst("starting quack server: db=".count).components(separatedBy: " listen=").first {
             return "started (\((db as NSString).lastPathComponent))"
         }
+        if m.hasPrefix("quack server stopped responding") { return "not responding, restarting" }
         if m.hasPrefix("quack server stopped") { return "stopped" }
+        if m.hasPrefix("quack server exited after it stopped responding") { return "exited (not responding)" }
         if m.hasPrefix("quack server exited unexpectedly") {
             return "crashed" + (m.range(of: "(exit code").map { " " + m[$0.lowerBound...] } ?? "")
         }
@@ -512,6 +522,7 @@ final class Controller: ObservableObject {
         switch status.phase {
         case .unknown: return status.error
         case .noDuckDB: return "Install it with: brew install duckdb"
+        case .notResponding: return "It will restart on its own shortly, or click Restart."
         case .notConfigured:
             // A missing config just needs setup; any other config problem is worth showing.
             return status.configError.hasPrefix("no config at") ? nil : status.configError
@@ -551,7 +562,7 @@ struct MenuContent: View {
             Button("Install Service") { controller.perform(["install"]) }.disabled(!idle)
         default:
             Button("Start") { controller.perform(["start"]) }
-                .disabled(!idle || phase == .running || phase == .starting || phase == .unknown)
+                .disabled(!idle || phase == .running || phase == .starting || phase == .notResponding || phase == .unknown)
             Button("Stop") { controller.stopServer() }
                 .disabled(!idle || phase == .stopped || phase == .gaveUp || phase == .unknown)
             Button("Restart") { controller.restartServer() }

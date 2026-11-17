@@ -19,7 +19,7 @@
 # https://github.com/kofoide/quackd — MIT License
 set -euo pipefail
 
-QUACKD_VERSION="1.6.4"
+QUACKD_VERSION="1.6.5"
 # launchd job label; override with QUACKD_LABEL to run a second, separate service.
 LABEL="${QUACKD_LABEL:-net.kofoid.quackd}"
 # Every location can be overridden by environment variable (used by the tests, and
@@ -38,11 +38,16 @@ FAIL_FILE="$STATE_DIR/$LABEL.failures"
 CLIENTS_FILE="$STATE_DIR/$LABEL.clients"
 TICK=2
 STABLE_SECONDS=60   # a run that lasted this long resets the consecutive-failure count
-STOP_TIMEOUT=15     # seconds to wait for the shutdown checkpoint before sending SIGTERM
+STOP_TIMEOUT="${QUACKD_STOP_TIMEOUT:-15}"   # seconds to wait for the shutdown checkpoint before SIGTERM
+# The running service checks every HEALTH_EVERY seconds that the server answers HTTP,
+# and restarts it after HEALTH_FAILURES misses in a row (see cmd_run).
+HEALTH_EVERY="${QUACKD_HEALTH_EVERY:-30}"
+HEALTH_FAILURES="${QUACKD_HEALTH_FAILURES:-3}"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DOMAIN="gui/$(id -u)"
 
 RUN_MODE=""   # set by `run`, so errors go to the log with a timestamp
+EXIT_REASON="" # set by `run` to explain a non-zero exit in the notification
 
 # Current local time as "YYYY-MM-DD HH:MM:SS", the timestamp format used in the log.
 ts() { date '+%F %T'; }
@@ -172,6 +177,7 @@ cmd_run() {
   # which decides whether launchd should retry.
   trap 'on_run_exit $?' EXIT
   load_config
+  listen_host_port
   [[ -f "$QUACK_DB" ]] || die "database not found: $QUACK_DB"
 
   local serve
@@ -257,41 +263,76 @@ cmd_run() {
   snapshot+=" strftime(timezone('UTC', query_started_at), '%Y-%m-%d %H:%M:%S') FROM quack_active_connections()"
   snapshot+=" ORDER BY query_started_at) TO $(sql_quote "$CLIENTS_FILE") (FORMAT csv, HEADER false);"
 
-  # launchd stops the job with SIGTERM. Rather than killing duckdb, ask it to
-  # CHECKPOINT (flush the WAL into the database file) and then .quit, so it closes the
-  # database cleanly. duckdb reads stdin in order, so this runs after anything already
-  # queued. If it hasn't exited after STOP_TIMEOUT seconds (e.g. a long client query is
-  # holding things up), or a second signal arrives, fall back to SIGTERM. STOP_TIMEOUT
-  # stays under launchd's 20s ExitTimeOut, after which launchd sends SIGKILL.
-  local signal="" watchdog=""
-  # shellcheck disable=SC2329  # invoked from the traps below
-  stop_server() {
-    if [[ -n "$signal" ]]; then kill -TERM "$child" 2>/dev/null || true; return 0; fi
-    signal=$1
-    echo "$(ts) received SIG$1: checkpointing database before stopping"
+  # Stopping: rather than killing duckdb, ask it to CHECKPOINT (flush the WAL into the
+  # database file) and then .quit, so it closes the database cleanly. duckdb reads
+  # stdin in order, so this runs after anything already queued. If it hasn't exited
+  # after STOP_TIMEOUT seconds (e.g. a long client query is holding things up), send
+  # SIGTERM, and SIGKILL 5 seconds after that. STOP_TIMEOUT stays under launchd's 20s
+  # ExitTimeOut, after which launchd sends SIGKILL itself. The watchdog's stderr is
+  # discarded so bash's "Terminated" notice for its sleep doesn't land in the log.
+  local signal="" unresponsive="" watchdog=""
+  # shellcheck disable=SC2329  # invoked from the traps and the loop below
+  stop_server() {   # stop_server <log message>
+    echo "$(ts) $1"
     printf '.output /dev/null\nCHECKPOINT;\n.quit\n' >&3 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
     ( sleep "$STOP_TIMEOUT"
       kill -0 "$child" 2>/dev/null || exit 0
       echo "$(ts) quackd: server didn't stop within ${STOP_TIMEOUT}s; sending SIGTERM"
-      kill -TERM "$child" 2>/dev/null ) &
+      kill -TERM "$child" 2>/dev/null
+      sleep 5
+      kill -0 "$child" 2>/dev/null || exit 0
+      echo "$(ts) quackd: server still running; sending SIGKILL"
+      kill -KILL "$child" 2>/dev/null ) 2>/dev/null &
     watchdog=$!
   }
-  trap 'stop_server TERM' TERM
-  trap 'stop_server INT' INT
-  trap 'stop_server HUP' HUP
+  # launchd stops the job with SIGTERM. A second signal skips the checkpoint. A signal
+  # during an unresponsive restart (already stopping) just makes it a clean stop.
+  # shellcheck disable=SC2329  # invoked from the traps below
+  on_stop_signal() {
+    if [[ -n "$signal" ]]; then kill -TERM "$child" 2>/dev/null || true; return 0; fi
+    signal=$1
+    [[ -n "$unresponsive" ]] && return 0
+    stop_server "received SIG$1: checkpointing database before stopping"
+  }
+  trap 'on_stop_signal TERM' TERM
+  trap 'on_stop_signal INT' INT
+  trap 'on_stop_signal HUP' HUP
 
-  # Until duckdb exits: take a snapshot and check the log size every TICK seconds.
-  # The sleep runs in the background because `wait` (unlike a foreground command)
-  # returns as soon as a trap fires, so stopping is never delayed. After a signal,
-  # just wait for duckdb to finish shutting down.
-  local rc=0 sleeper
+  # Until duckdb exits: take a snapshot and check the log size every TICK seconds, and
+  # every HEALTH_EVERY seconds check that the server still answers HTTP. A server can
+  # stay alive but stop answering (seen after the Mac sleeps); launchd can't tell, so
+  # after HEALTH_FAILURES misses in a row, stop it and exit non-zero so launchd starts
+  # a fresh one. Sleeping in between doesn't count: the checks are paused too. Misses
+  # only count once the server has answered at least once, so a slow start (e.g. the
+  # first INSTALL spatial on a slow network) is never mistaken for a stuck server.
+  # The sleep and the check run in the background because `wait` (unlike a foreground
+  # command) returns as soon as a trap fires, so stopping is never delayed. Once
+  # stopping, just wait for duckdb to finish shutting down.
+  local rc=0 sleeper probe ticks=0 misses=0 answered="" check_ticks
+  check_ticks=$(( HEALTH_EVERY / TICK )); (( check_ticks > 0 )) || check_ticks=1
   while kill -0 "$child" 2>/dev/null; do
-    if [[ -n "$signal" ]]; then
+    if [[ -n "$signal" || -n "$unresponsive" ]]; then
       wait "$child" 2>/dev/null || true
       continue
     fi
     printf '%s\n' "$snapshot" >&3
     rotate_log_if_needed
+    ticks=$(( ticks + 1 ))
+    if (( HEALTH_FAILURES > 0 && ticks % check_ticks == 0 )); then
+      server_responds "$LISTEN_HOST" "$LISTEN_PORT" &
+      probe=$!
+      if wait "$probe" 2>/dev/null; then
+        misses=0; answered=1
+      elif [[ -n "$answered" && -z "$signal" ]]; then
+        misses=$(( misses + 1 ))
+        echo "$(ts) quackd: server didn't answer on $LISTEN_HOST:$LISTEN_PORT (check $misses of $HEALTH_FAILURES)"
+        if (( misses >= HEALTH_FAILURES )); then
+          unresponsive=1
+          stop_server "quack server stopped responding; restarting it"
+          continue
+        fi
+      fi
+    fi
     sleep "$TICK" &
     sleeper=$!
     wait "$sleeper" 2>/dev/null || true
@@ -306,6 +347,11 @@ cmd_run() {
   if [[ -n "$signal" ]]; then
     echo "$(ts) quack server stopped (received SIG$signal)"
     exit 0
+  fi
+  if [[ -n "$unresponsive" ]]; then
+    echo "$(ts) quack server exited after it stopped responding"
+    EXIT_REASON="It stopped responding on $LISTEN_HOST:$LISTEN_PORT."
+    exit 1
   fi
   echo "$(ts) quack server exited unexpectedly (exit code $rc)"
   exit $(( rc == 0 ? 1 : rc ))   # never report success for an unexpected exit
@@ -338,7 +384,7 @@ on_run_exit() {
   fi
   # Notify once per incident (the first failure), not on every retry.
   if (( n == 1 )); then
-    notify "Quack server stopped unexpectedly" "Exit code $rc. Retrying automatically."
+    notify "Quack server stopped unexpectedly" "${EXIT_REASON:-Exit code $rc.} Retrying automatically."
   fi
   if (( max > 0 )); then
     echo "$(ts) quackd: failure $n of $max; launchd will retry in about 10 seconds" >&2
@@ -522,11 +568,13 @@ cmd_restart() {
 
 # Machine-readable status: one key=value per line, values never quoted. Keys:
 # version installed loaded state pid runs last_exit failures max_failures listening
-# host port log config configured config_error duckdb service_script db connections
+# responding host port log config configured config_error duckdb service_script db
+# connections. listening=yes means the port accepts TCP; responding=yes means the
+# server actually answers (listening without responding: the server is stuck).
 # (connections is empty when unknown, e.g. the server isn't running)
 # The menu bar app depends on these keys: add new ones freely, don't rename or remove.
 status_porcelain() {
-  local info="" state="" pid="" runs="" last_exit="" failures=0 listening=no host="" port=""
+  local info="" state="" pid="" runs="" last_exit="" failures=0 listening=no responding=no host="" port=""
   local installed=no loaded=no max="5" configured=no config_error="" service_script="" db=""
   local connections
   connections="$(connection_count)" || connections=""
@@ -553,13 +601,19 @@ status_porcelain() {
     max="${QUACK_MAX_FAILURES:-5}"; [[ "$max" =~ ^[0-9]+$ ]] || max=5
     listen_host_port
     host="$LISTEN_HOST"; port="$LISTEN_PORT"
-    nc -z -G 2 "$host" "$port" 2>/dev/null && listening=yes
+    # listening: the port accepts TCP. responding: the server actually answers.
+    # listening without responding means the server is stuck.
+    if server_responds "$host" "$port"; then
+      listening=yes; responding=yes
+    elif port_open "$host" "$port"; then
+      listening=yes
+    fi
   else
     find_duckdb
   fi
   printf '%s\n' "version=$QUACKD_VERSION" "installed=$installed" "loaded=$loaded" "state=$state" \
     "pid=$pid" "runs=$runs" "last_exit=$last_exit" "failures=$failures" "max_failures=$max" \
-    "listening=$listening" "host=$host" "port=$port" "log=$LOG_FILE" "config=$CONFIG_FILE" \
+    "listening=$listening" "responding=$responding" "host=$host" "port=$port" "log=$LOG_FILE" "config=$CONFIG_FILE" \
     "configured=$configured" "config_error=${config_error//$'\n'/ }" "duckdb=${DUCKDB_BIN:-}" \
     "service_script=$service_script" "db=$db" "connections=$connections"
 }
@@ -571,6 +625,20 @@ listen_host_port() {
   [[ "$hostport" == *:* ]] && LISTEN_PORT="${hostport##*:}"
   return 0
 }
+
+# True if the Quack server on $1:$2 actually answers. A plain GET / gets a short
+# banner from the server; it needs no token and isn't logged as a connection. This
+# is stronger than checking the port with nc: macOS completes TCP handshakes from the
+# listen backlog even when the server process is stuck and never accepts them.
+server_responds() {
+  local body
+  body="$(curl -s --noproxy '*' --max-time 2 "http://$1:$2/" 2>/dev/null)" || return 1
+  [[ "$body" == *"Quack RPC endpoint"* ]]
+}
+
+# True if anything accepts TCP connections on $1:$2 (see server_responds for why
+# that alone doesn't mean the server works).
+port_open() { nc -z -G 2 "$1" "$2" 2>/dev/null; }
 
 # The name `connect` attaches the server as: the database's file name without its
 # extension (sales.duckdb → sales), made into a plain SQL identifier so it never
@@ -672,10 +740,17 @@ cmd_status() {
   listen_host_port
   local host="$LISTEN_HOST" port="$LISTEN_PORT"
   echo "  database: $QUACK_DB"
-  if nc -z -G 2 "$host" "$port" 2>/dev/null; then
+  if server_responds "$host" "$port"; then
     echo "  listening: yes ($host:$port)"
     local n
     if n="$(connection_count)"; then echo "  connections: $n"; fi
+  elif port_open "$host" "$port"; then
+    echo "  listening: not responding ($host:$port): the port is open but the server doesn't answer"
+    if (( HEALTH_FAILURES > 0 )); then
+      echo "  (the service restarts it after $HEALTH_FAILURES missed checks; or run: quackd restart)"
+    else
+      echo "  (run: quackd restart)"
+    fi
   else
     echo "  listening: no ($host:$port)"
   fi

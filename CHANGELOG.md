@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here. Versions follow [Semantic Versioning](https://semver.org).
 
+## [1.6.5] - 2026-11-17
+
+### quackd (CLI)
+- The service now checks every 30 seconds that the server actually answers. A server could stay running but stop answering, for example after the Mac slept, and quackd still reported it as running. After 3 missed checks in a row, it restarts the server and notifies you, and the restart counts as a failure toward `QUACK_MAX_FAILURES`. Checks only start counting once the server has answered once, so a slow start is never treated as a stuck server.
+- `quackd status` checks the server with a real HTTP request instead of only checking that the port is open. A stuck server shows as `listening: not responding`. `status --porcelain` has a new `responding` key. `listening` still means the port accepts connections.
+- Stopping a server that doesn't finish its checkpoint now sends SIGKILL 5 seconds after the SIGTERM fallback.
+- Stopping no longer writes a stray `Terminated: 15  sleep "$STOP_TIMEOUT"` line to the log.
+
+### Quackd.app
+- New "Not responding" status, with a warning icon, when the server is running but doesn't answer. Recent Activity shows these restarts as "not responding, restarting" and "exited (not responding)".
+
 ## [1.6.4] - 2026-11-16
 
 ### quackd (CLI)
